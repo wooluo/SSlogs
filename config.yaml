@@ -20,12 +20,8 @@ rule_dir: rules
 rules:
   path: rules/
   default_severity: medium
-<<<<<<< HEAD
   case_sensitive: false
   max_matches: 50
-=======
-  path: rules/
->>>>>>> dbcfc95695db2065f726934b2d7b14ab8dd244c4
   auto_reload: true
 analysis:
   batch_size: 1000
@@ -155,6 +151,14 @@ ollama:
   model: deepseek-r1:14b
   base_url: http://localhost:11434/api/chat
   timeout: 60
+# 自定义 OpenAI 兼容端点：把 ai.cloud_provider 设为 custom 时启用。
+# base_url 为 OpenAI 兼容 base（通常以 /v1 结尾）；api_key 建议留空走环境变量 SSLOGS_AI_API_KEY。
+custom:
+  base_url: https://api.openai.com/v1
+  api_key: ''
+  model: gpt-4o-mini
+  timeout: 30
+  max_tokens: 2048
 geoip_db_path: config/GeoLite2-Country.mmdb
 
 # 日志配置

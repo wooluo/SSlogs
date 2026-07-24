@@ -273,6 +273,14 @@ class UnifiedConfigManager(IConfigManager):
                     deepseek_config = ai_config.get('deepseek', {})
                     if not deepseek_config.get('api_key'):
                         errors.append("DeepSeek配置缺少api_key")
+                elif ai_config['cloud_provider'] == 'custom':
+                    # 自定义 OpenAI 兼容端点：要求 base_url 与 model
+                    # (api_key 允许留空，走环境变量 SSLOGS_AI_API_KEY)
+                    custom_config = ai_config.get('custom', {})
+                    if not custom_config.get('base_url'):
+                        errors.append("自定义AI配置缺少base_url")
+                    if not custom_config.get('model'):
+                        errors.append("自定义AI配置缺少model")
 
         # 规则配置验证
         if 'rules' in config:

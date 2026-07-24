@@ -73,6 +73,7 @@ ai_analysis:
 ai:
   type: cloud
   local_provider: ollama
+  # cloud_provider 可选：deepseek（读 deepseek: 段）或 custom（读 custom: 段，任意 OpenAI 兼容端点）
   cloud_provider: deepseek
   max_retries: 3
   retry_delay: 1
@@ -92,6 +93,19 @@ ollama:
   model: deepseek-r1:14b
   base_url: http://localhost:11434/api/chat
   timeout: 60
+
+# 自定义 OpenAI 兼容端点配置
+# 当 ai.cloud_provider 设置为 custom 时启用，可指向任意 OpenAI 兼容 API
+# （OpenAI / 通义千问 / Moonshot / SiliconFlow 自选模型 / 自建 vLLM / Ollama 的 OpenAI 兼容口 等）。
+#
+# base_url 为 OpenAI 兼容的 base 地址（通常以 /v1 结尾，无需包含 /chat/completions）。
+# api_key 建议留空并使用环境变量：export SSLOGS_AI_API_KEY="your-actual-api-key"
+custom:
+  base_url: https://api.openai.com/v1   # 例：https://api.openai.com/v1 或 http://localhost:11434/v1
+  api_key: ""                            # 留空则读取环境变量 SSLOGS_AI_API_KEY
+  model: gpt-4o-mini                     # 任意模型名，可在 GUI 中从 /models 拉取
+  timeout: 30
+  max_tokens: 2048
 
 # LM Studio 配置 (v3.1新增)
 lm_studio:

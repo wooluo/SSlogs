@@ -9,6 +9,8 @@ import os
 import asyncio
 import time
 import threading
+import yaml
+import requests
 from pathlib import Path
 
 # 添加项目根目录到Python路径
@@ -22,7 +24,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QSplitter, QFrame, QScrollArea,
     QDialog, QDialogButtonBox, QFormLayout
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QFont, QPixmap, QIcon, QColor, QPalette
 
 # 导入优化后的核心模块
@@ -34,6 +36,7 @@ from core import (
     validate_input, sanitize_input, handle_exceptions,
     create_error_context, cache_result, CachePolicy
 )
+from core.ai_analyzer import fetch_available_models
 
 
 class AnalysisWorker(QThread):
@@ -238,13 +241,41 @@ class AnalysisWorker(QThread):
         self.log_output.emit("⏹️ 用户中断分析...")
 
 
+class _BackgroundAIWorker(QThread):
+    """在后台线程运行 AI 网络任务（拉取模型 / 测试连接），避免阻塞 UI。
+
+    task 是一个无参 callable，返回 (ok: bool, message: str, payload)。
+    结果通过 result_ready 信号回传到主线程。
+    """
+    result_ready = pyqtSignal(bool, str, object)
+
+    def __init__(self, task):
+        super().__init__()
+        self._task = task
+
+    def run(self):
+        try:
+            ok, message, payload = self._task()
+        except Exception as e:
+            ok, message, payload = False, f"请求异常: {e}", None
+        self.result_ready.emit(bool(ok), str(message), payload)
+
+
 class OptimizedLogAnalyzerGUI(QMainWindow):
     """SSlogs v3.1 优化版GUI界面"""
+
+    # AI 模型类型下拉项与 cloud_provider 的映射
+    _AI_TYPE_CLOUD = "🌐 自定义 OpenAI 兼容"
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("🚀 SSlogs v3.1 - 企业级智能安全日志分析平台")
         self.setGeometry(100, 100, 1200, 900)
+
+        # 配置文件路径（项目根目录下的 config.yaml）
+        self.config_path = str(Path(__file__).parent / 'config.yaml')
+        # 后台 AI 网络任务句柄（防止被 GC 回收）
+        self._ai_worker = None
 
         # 设置应用图标和样式
         self._setup_appearance()
@@ -269,6 +300,9 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
 
         # 初始化定时器
         self._setup_timers()
+
+        # 从 config.yaml 回填 AI 配置到界面
+        self._load_ai_config_from_yaml()
 
     def _setup_appearance(self):
         """设置界面外观"""
@@ -495,9 +529,18 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         model_layout = QHBoxLayout()
         model_layout.addWidget(QLabel("AI模型类型:"))
         self.ai_model_type = QComboBox()
-        self.ai_model_type.addItems(["云端 DeepSeek", "本地 LM Studio", "本地 Ollama"])
+        self.ai_model_type.addItems(["云端 DeepSeek", "本地 LM Studio", "本地 Ollama", "🌐 自定义 OpenAI 兼容"])
+        self.ai_model_type.currentTextChanged.connect(self._on_ai_type_changed)
         model_layout.addWidget(self.ai_model_type)
         service_layout.addLayout(model_layout)
+
+        # API基础URL（自定义/OpenAI 兼容端点）
+        base_url_layout = QHBoxLayout()
+        base_url_layout.addWidget(QLabel("API地址:"))
+        self.base_url_input = QLineEdit()
+        self.base_url_input.setPlaceholderText("OpenAI 兼容 base，如 https://api.openai.com/v1")
+        base_url_layout.addWidget(self.base_url_input)
+        service_layout.addLayout(base_url_layout)
 
         # 模型选择
         model_select_layout = QHBoxLayout()
@@ -516,7 +559,7 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         api_layout.addWidget(QLabel("API密钥:"))
         self.api_key_input = QLineEdit()
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_input.setPlaceholderText("云端服务API密钥")
+        self.api_key_input.setPlaceholderText("云端服务API密钥（可改用环境变量 SSLOGS_AI_API_KEY）")
         api_layout.addWidget(self.api_key_input)
         service_layout.addLayout(api_layout)
 
@@ -534,12 +577,18 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         parent_layout.addWidget(service_group)
 
         # 测试区域
-        test_group = QGroupBox("🧪 连接测试")
+        test_group = QGroupBox("🧪 连接与配置")
         test_layout = QVBoxLayout()
 
+        test_action_layout = QHBoxLayout()
         test_btn = QPushButton("测试AI连接")
         test_btn.clicked.connect(self.test_ai_connection)
-        test_layout.addWidget(test_btn)
+        test_action_layout.addWidget(test_btn)
+
+        save_ai_btn = QPushButton("💾 保存AI配置")
+        save_ai_btn.clicked.connect(self._save_ai_config_to_yaml)
+        test_action_layout.addWidget(save_ai_btn)
+        test_layout.addLayout(test_action_layout)
 
         self.ai_status_label = QLabel("状态: 未测试")
         test_layout.addWidget(self.ai_status_label)
@@ -800,49 +849,230 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         if directory:
             self.output_dir_input.setText(directory)
 
+    # 下拉文本 -> (cloud_provider/local_provider, ai.type, 是否需要 base_url)
+    _PROVIDER_MAP = {
+        "云端 DeepSeek": ("deepseek", "cloud", True),
+        "本地 LM Studio": ("lm_studio", "local", True),
+        "本地 Ollama": ("ollama", "local", True),
+        "🌐 自定义 OpenAI 兼容": ("custom", "cloud", True),
+    }
+
+    def _on_ai_type_changed(self, text: str):
+        """切换 AI 模型类型时，更新 base_url 输入的可用性与占位提示。"""
+        mapping = self._PROVIDER_MAP.get(text)
+        self.base_url_input.setEnabled(bool(mapping and mapping[2]))
+        placeholders = {
+            "本地 Ollama": "如 http://localhost:11434/api/chat",
+            "本地 LM Studio": "如 http://localhost:1234/v1",
+            "云端 DeepSeek": "如 https://api.siliconflow.cn/v1/chat/completions",
+            "🌐 自定义 OpenAI 兼容": "OpenAI 兼容 base，如 https://api.openai.com/v1",
+        }
+        self.base_url_input.setPlaceholderText(placeholders.get(text, "API 地址"))
+
+    def _current_ai_provider(self):
+        """返回当前下拉选择的 (provider_name, ai_type)。"""
+        text = self.ai_model_type.currentText()
+        mapping = self._PROVIDER_MAP.get(text)
+        if mapping:
+            return mapping[0], mapping[1]
+        return "deepseek", "cloud"
+
     def refresh_models(self):
-        """刷新AI模型列表"""
+        """从当前配置的 OpenAI 兼容端点拉取可用模型列表（后台线程，不阻塞 UI）。"""
+        base_url = self.base_url_input.text().strip()
+        api_key = self.api_key_input.text().strip()
+
+        if not base_url:
+            QMessageBox.warning(self, "缺少地址", "请先填写 API 地址 (base_url)")
+            return
+
         self.model_name_combo.clear()
-        self.model_name_combo.addItem("正在加载模型...")
+        self.model_name_combo.addItem("⏳ 正在拉取模型列表...")
 
-        # 模拟模型加载
-        QTimer.singleShot(1000, self._load_models)
+        def task():
+            models = fetch_available_models(base_url, api_key, timeout=10)
+            if models:
+                return True, f"成功获取 {len(models)} 个模型", models
+            return False, "未能获取模型（端点可能不支持 /models，可手动填写模型名）", []
 
-    def _load_models(self):
-        """加载模型列表"""
-        try:
-            # 这里应该调用实际的模型加载逻辑
-            models = [
-                "deepseek-r1:1.5b",
-                "deepseek-r1:7b",
-                "deepseek-r1:14b",
-                "qwen2.5-coder:7b",
-                "llama3.1:8b",
-                "mistral:7b"
-            ]
+        self._ai_worker = _BackgroundAIWorker(task)
+        self._ai_worker.result_ready.connect(self._on_models_fetched)
+        self._ai_worker.start()
 
-            self.model_name_combo.clear()
+    @pyqtSlot(bool, str, object)
+    def _on_models_fetched(self, ok: bool, message: str, models):
+        """模型拉取完成回调（主线程）。"""
+        current = self.model_name_combo.currentText()
+        self.model_name_combo.clear()
+        if ok and models:
             self.model_name_combo.addItems(models)
-            self.model_name_combo.setCurrentIndex(0)
-
-        except Exception as e:
-            self.model_name_combo.clear()
-            self.model_name_combo.addItem(f"加载失败: {str(e)[:30]}...")
+            # 尽量保留用户已填写的模型名
+            if current and current not in ("⏳ 正在拉取模型列表...",):
+                self.model_name_combo.setCurrentText(current)
+            self.ai_status_label.setText(f"✅ {message}")
+            self.ai_status_label.setStyleSheet("color: #10b981;")
+        else:
+            # 拉取失败：下拉仍可手填
+            self.ai_status_label.setText(f"⚠️ {message}")
+            self.ai_status_label.setStyleSheet("color: #d97706;")
 
     def test_ai_connection(self):
-        """测试AI连接"""
-        try:
-            self.ai_status_label.setText("🔄 正在测试...")
-            # 模拟连接测试
-            QTimer.singleShot(2000, self._ai_test_result)
-        except Exception as e:
-            self.ai_status_label.setText(f"❌ 测试失败: {str(e)}")
+        """测试与 AI 端点的连接（后台线程，真实请求 GET /models）。"""
+        base_url = self.base_url_input.text().strip()
+        api_key = self.api_key_input.text().strip()
 
-    def _ai_test_result(self):
-        """AI测试结果"""
-        # 模拟测试成功
-        self.ai_status_label.setText("✅ 连接测试成功")
-        self.ai_status_label.setStyleSheet("color: #10b981;")
+        if not base_url:
+            QMessageBox.warning(self, "缺少地址", "请先填写 API 地址 (base_url)")
+            return
+
+        self.ai_status_label.setText("🔄 正在测试连接...")
+        self.ai_status_label.setStyleSheet("color: #6b7280;")
+
+        def task():
+            headers = {'Content-Type': 'application/json'}
+            if api_key:
+                headers['Authorization'] = f'Bearer {api_key}'
+            # 派生 /models 端点：去掉可能的 /chat/completions 后缀
+            base = base_url.rstrip('/')
+            if base.endswith('/chat/completions'):
+                base = base[:-len('/chat/completions')]
+            models_url = base + '/models'
+            try:
+                resp = requests.get(models_url, headers=headers, timeout=10)
+            except requests.exceptions.Timeout:
+                return False, "请求超时，请检查地址与网络", 0
+            except requests.exceptions.ConnectionError:
+                return False, "无法连接到服务器，请检查地址与端口", 0
+            status = resp.status_code
+            if status == 200:
+                return True, "连接成功", status
+            if status == 401:
+                return False, "认证失败：API 密钥无效或缺失", status
+            if status == 404:
+                return False, "地址错误：/models 返回 404", status
+            return False, f"连接失败 (HTTP {status})", status
+
+        self._ai_worker = _BackgroundAIWorker(task)
+        self._ai_worker.result_ready.connect(self._on_connection_tested)
+        self._ai_worker.start()
+
+    @pyqtSlot(bool, str, object)
+    def _on_connection_tested(self, ok: bool, message: str, status):
+        """连接测试结果回调（主线程）。"""
+        if ok:
+            self.ai_status_label.setText(f"✅ {message}")
+            self.ai_status_label.setStyleSheet("color: #10b981;")
+        else:
+            self.ai_status_label.setText(f"❌ {message}")
+            self.ai_status_label.setStyleSheet("color: #ef4444;")
+
+    def _load_ai_config_from_yaml(self):
+        """启动时从 config.yaml 回填 AI 配置到界面控件。"""
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            return
+        except Exception:
+            return  # 配置不可读时静默，使用界面默认值
+
+        ai_cfg = config.get('ai', {}) or {}
+        cloud_provider = ai_cfg.get('cloud_provider') or ai_cfg.get('local_provider') or 'deepseek'
+
+        # 反向映射 provider 名 -> 下拉文本
+        label = "云端 DeepSeek"
+        for lbl, (prov, _typ, _url) in self._PROVIDER_MAP.items():
+            if prov == cloud_provider:
+                label = lbl
+                break
+        idx = self.ai_model_type.findText(label)
+        if idx >= 0:
+            self.ai_model_type.setCurrentIndex(idx)
+
+        # 按当前 provider 读取对应配置段
+        section = config.get(cloud_provider, {}) or {}
+        if section.get('base_url'):
+            self.base_url_input.setText(str(section['base_url']))
+        if section.get('api_key'):
+            self.api_key_input.setText(str(section['api_key']))
+        if section.get('model'):
+            self.model_name_combo.setCurrentText(str(section['model']))
+
+    def _save_ai_config_to_yaml(self):
+        """把界面上的 AI 配置写回 config.yaml（按所选 provider 更新对应段，保留注释）。"""
+        provider, ai_type = self._current_ai_provider()
+        base_url = self.base_url_input.text().strip()
+        api_key = self.api_key_input.text().strip()
+        model = self.model_name_combo.currentText().strip()
+
+        if not base_url and provider in ('custom', 'deepseek'):
+            QMessageBox.warning(self, "缺少地址", "请先填写 API 地址 (base_url)")
+            return
+
+        # 优先用 ruamel.yaml 做注释保留的 round-trip；不可用时回退到 PyYAML（会丢注释）
+        use_ruamel = False
+        try:
+            from ruamel.yaml import YAML
+            yaml_rt = YAML()
+            yaml_rt.preserve_quotes = True
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                config = yaml_rt.load(f) or {}
+            use_ruamel = True
+        except Exception:
+            try:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                config = {}
+            except Exception as e:
+                QMessageBox.critical(self, "读取配置失败", str(e))
+                return
+
+        # 更新 ai.type / ai.cloud_provider / ai.local_provider
+        ai_cfg = config.setdefault('ai', {})
+        ai_cfg['type'] = ai_type
+        if ai_type == 'cloud':
+            ai_cfg['cloud_provider'] = provider
+        else:
+            ai_cfg['local_provider'] = provider
+
+        # 按所选 provider 更新对应配置段
+        if provider in ('custom', 'deepseek'):
+            section = config.setdefault(provider, {})
+            section['base_url'] = base_url
+            section['api_key'] = api_key
+            if model:
+                section['model'] = model
+            section.setdefault('timeout', 30)
+            section.setdefault('max_tokens', 2048)
+        elif provider == 'ollama':
+            section = config.setdefault('ollama', {})
+            if base_url:
+                section['base_url'] = base_url
+            if model:
+                section['model'] = model
+            section.setdefault('timeout', 60)
+        elif provider == 'lm_studio':
+            section = config.setdefault('lm_studio', {})
+            if base_url:
+                section['base_url'] = base_url
+            if model:
+                section['model'] = model
+
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                if use_ruamel:
+                    yaml_rt.dump(config, f)
+                else:
+                    yaml.safe_dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        except Exception as e:
+            QMessageBox.critical(self, "保存配置失败", str(e))
+            return
+
+        QMessageBox.information(
+            self, "保存成功",
+            f"AI 配置已保存到 config.yaml\n(provider={provider}, type={ai_type})"
+        )
 
     def clear_cache(self):
         """清空缓存"""

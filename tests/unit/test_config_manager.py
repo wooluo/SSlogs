@@ -207,6 +207,43 @@ deepseek:
         finally:
             os.unlink(temp_path)
 
+    def test_get_safe_config_custom(self):
+        """测试自定义端点 custom.api_key 同样被脱敏"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+custom:
+  api_key: sk-1234567890abcdef
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            manager.load_config()
+            safe_config = manager.get_safe_config()
+
+            # 自定义端点的 API 密钥也应被脱敏（保留首4/末4，中间以 * 替换）
+            masked = safe_config['custom']['api_key']
+            assert masked != 'sk-1234567890abcdef'   # 已脱敏，不再是明文
+            assert masked.startswith('sk-1') and masked.endswith('cdef')
+            assert '*' in masked
+            # base_url 等非敏感字段保持不变
+            assert 'https://api.openai.com/v1' == safe_config['custom']['base_url']
+        finally:
+            os.unlink(temp_path)
+
+
 
 class TestConfigValidation:
     """配置验证测试"""
@@ -279,6 +316,73 @@ report_type: invalid_format  # 无效的报告格式
             assert '值无效' in error_message
         finally:
             os.unlink(temp_path)
+
+    def test_custom_cloud_provider_accepted(self):
+        """测试 cloud_provider=custom 且 custom 配置完整时通过校验"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+ai:
+  type: cloud
+  cloud_provider: custom
+
+custom:
+  base_url: https://api.openai.com/v1
+  api_key: sk-1234567890abcdef
+  model: gpt-4o-mini
+  timeout: 30
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            # 配置完整时不应抛出校验异常
+            manager.load_config()
+            assert manager.get_config()['ai']['cloud_provider'] == 'custom'
+        finally:
+            os.unlink(temp_path)
+
+    def test_custom_cloud_provider_missing_base_url_rejected(self):
+        """测试 cloud_provider=custom 但缺少 base_url 时被校验拦截"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+ai:
+  type: cloud
+  cloud_provider: custom
+
+custom:
+  base_url: ""
+  model: gpt-4o-mini
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            with pytest.raises(ConfigurationError) as exc_info:
+                manager.load_config()
+            assert 'base_url' in str(exc_info.value)
+        finally:
+            os.unlink(temp_path)
+
 
 
 class TestConfigValidationMethods:
