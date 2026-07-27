@@ -528,6 +528,81 @@ class TestCustomCloudProvider:
         mock_post.assert_not_called()
 
 
+class TestZhipuCloudProvider:
+    """智谱 GLM 云端 provider 测试 (cloud_provider='zhipu')"""
+
+    @staticmethod
+    def _make_analyzer(coding_plan=False, base_url='', api_key='zhipu-key'):
+        """构造一个智谱 provider 分析器（patch 掉配置加载与 HTTP 会话初始化）"""
+        config = {
+            'ai': {'type': 'cloud', 'cloud_provider': 'zhipu'},
+            'zhipu': {
+                'api_key': api_key,
+                'model': 'glm-4.6',
+                'coding_plan': coding_plan,
+                'base_url': base_url,
+                'timeout': 20,
+                'max_tokens': 800
+            }
+        }
+        with patch('core.ai_analyzer.AIAnalyzer._load_config', return_value=config):
+            with patch('core.ai_analyzer.AIAnalyzer._init_http_session'):
+                return AIAnalyzer(config_path='dummy')
+
+    @pytest.fixture
+    def analyzer(self):
+        """标准端点（coding_plan=False）的智谱分析器"""
+        return self._make_analyzer(coding_plan=False)
+
+    def test_zhipu_provider_config_loaded(self, analyzer):
+        """智谱 provider 正确加载 zhipu: 配置段（标准端点）"""
+        assert analyzer.cloud_provider == 'zhipu'
+        assert analyzer.cloud_model == 'glm-4.6'
+        assert analyzer.api_key == 'zhipu-key'
+        assert analyzer.cloud_max_tokens == 800
+        assert analyzer.cloud_timeout == 20
+        # base_url 留空 + coding_plan=False -> 派生标准端点
+        assert analyzer.cloud_base_url == 'https://open.bigmodel.cn/api/paas/v4'
+        # OpenAI 兼容的 Bearer 鉴权
+        assert analyzer.cloud_headers['Authorization'] == 'Bearer zhipu-key'
+
+    def test_zhipu_standard_chat_url(self, analyzer):
+        """标准端点派生正确的 chat / models 地址"""
+        assert analyzer._chat_url() == 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+        assert analyzer._models_url() == 'https://open.bigmodel.cn/api/paas/v4/models'
+
+    def test_zhipu_coding_plan_endpoint(self):
+        """coding_plan=True 时 base_url 派生为编程套餐专属端点"""
+        a = self._make_analyzer(coding_plan=True)
+        assert a.cloud_base_url == 'https://open.bigmodel.cn/api/coding/paas/v4'
+        assert a._chat_url() == 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions'
+
+    def test_zhipu_explicit_base_url_wins(self):
+        """显式配置的 base_url 优先于 coding_plan 派生值"""
+        a = self._make_analyzer(coding_plan=True, base_url='https://example.com/v1')
+        assert a.cloud_base_url == 'https://example.com/v1'
+
+    @patch('core.ai_analyzer.requests.post')
+    def test_analyze_with_zhipu_success(self, mock_post, analyzer):
+        """智谱 provider 成功调用云端分析（mock requests.post，避免真实网络）"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            'choices': [{'message': {'content': '智谱分析结果'}}]
+        }
+        mock_post.return_value = mock_response
+
+        result = analyzer._analyze_with_cloud('测试日志内容')
+
+        assert result == '智谱分析结果'
+        mock_post.assert_called_once()
+        # 请求 URL 为派生的标准端点 chat 地址
+        assert mock_post.call_args.args[0] == 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+        payload = mock_post.call_args.kwargs['json']
+        assert payload['model'] == 'glm-4.6'
+
+
 class TestFetchAvailableModels:
     """fetch_available_models 模块函数测试"""
 

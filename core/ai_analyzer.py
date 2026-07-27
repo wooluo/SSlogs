@@ -167,11 +167,12 @@ class AIAnalyzer:
     def _load_cloud_config(self):
         """加载云端 provider 配置。
 
-        支持两种云端 provider，二者均使用 OpenAI Chat Completions 协议：
+        支持三种云端 provider，三者均使用 OpenAI Chat Completions 协议：
         - 'deepseek'：读取 deepseek: 段（向后兼容）
         - 'custom'：读取 custom: 段，可指向任意 OpenAI 兼容端点（base_url + api_key + model）
+        - 'zhipu'：读取 zhipu: 段（智谱 GLM）；coding_plan=True 时默认走编程套餐端点
 
-        两种 provider 都填充同一组属性：self.cloud_model / cloud_base_url /
+        三种 provider 都填充同一组属性：self.cloud_model / cloud_base_url /
         cloud_headers / api_key / cloud_max_tokens / cloud_timeout。
         """
         if self.cloud_provider == 'deepseek':
@@ -184,6 +185,14 @@ class AIAnalyzer:
             default_base_url = ''   # custom 必须显式配置 base_url
             default_model = ''
             self.custom_config = section
+        elif self.cloud_provider == 'zhipu':
+            section = self.config.get('zhipu', {})
+            coding_plan = bool(section.get('coding_plan', False))
+            # 智谱均为 OpenAI 兼容端点；编程套餐(coding_plan)走专属 coding 端点
+            default_base_url = ('https://open.bigmodel.cn/api/coding/paas/v4'
+                                if coding_plan else 'https://open.bigmodel.cn/api/paas/v4')
+            default_model = 'glm-4.6'
+            self.zhipu_config = section
         else:
             # 未支持的云端 provider：置空云端配置，避免误用
             self.api_key = ''
@@ -196,7 +205,8 @@ class AIAnalyzer:
 
         self.api_key = self._get_secure_api_key(section)
         self.cloud_model = section.get('model', default_model)
-        self.cloud_base_url = section.get('base_url', default_base_url)
+        # base_url 为空字符串或缺省时回退到默认端点（智谱据此按 coding_plan 派生默认端点）
+        self.cloud_base_url = section.get('base_url') or default_base_url
         self.cloud_headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'

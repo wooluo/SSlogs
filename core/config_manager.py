@@ -111,6 +111,12 @@ class ConfigManager:
                     errors.append("自定义AI配置(custom)缺少 base_url")
                 if not custom_config.get('model'):
                     errors.append("自定义AI配置(custom)缺少 model")
+            elif cloud_provider == 'zhipu':
+                # 智谱 GLM：要求 model；base_url 允许留空（由 coding_plan 派生默认），
+                # api_key 允许留空（走环境变量 SSLOGS_AI_API_KEY）
+                zhipu_config = self._config.get('zhipu', {})
+                if not zhipu_config.get('model'):
+                    errors.append("智谱AI配置(zhipu)缺少 model")
 
         # 4. 验证路径字段
         for path_field in ['rule_dir', 'output_dir']:
@@ -126,7 +132,7 @@ class ConfigManager:
         # 5. 验证枚举类型字段
         enum_validations = {
             'ai.type': ['cloud', 'local'],
-            'ai.cloud_provider': ['deepseek', 'openai', 'custom'],
+            'ai.cloud_provider': ['deepseek', 'openai', 'custom', 'zhipu'],
             'ai.local_provider': ['ollama', 'lm_studio'],
             'report_type': ['html', 'json', 'markdown'],
         }
@@ -154,6 +160,7 @@ class ConfigManager:
             'deepseek.timeout': (5, 300, "DeepSeek超时应在5-300秒之间"),
             'ollama.timeout': (5, 600, "Ollama超时应在5-600秒之间"),
             'custom.timeout': (5, 600, "自定义AI超时应在5-600秒之间"),
+            'zhipu.timeout': (5, 600, "智谱AI超时应在5-600秒之间"),
         }
 
         for field_path, (min_val, max_val, error_msg) in range_validations.items():
@@ -318,6 +325,16 @@ class ConfigManager:
         custom.setdefault('timeout', 30)
         custom.setdefault('max_tokens', 2048)
 
+        # 智谱 GLM 默认值（cloud_provider=zhipu 时启用）
+        self._config.setdefault('zhipu', {})
+        zhipu = self._config['zhipu']
+        zhipu.setdefault('base_url', '')          # 留空则由 coding_plan 派生默认端点
+        zhipu.setdefault('api_key', '')           # 留空则读取环境变量 SSLOGS_AI_API_KEY
+        zhipu.setdefault('model', 'glm-4.6')
+        zhipu.setdefault('coding_plan', False)
+        zhipu.setdefault('timeout', 30)
+        zhipu.setdefault('max_tokens', 2048)
+
         # 重试配置默认值
         ai.setdefault('max_retries', 3)
         ai.setdefault('retry_delay', 1)
@@ -339,8 +356,8 @@ class ConfigManager:
         """获取安全的配置（隐藏敏感信息）"""
         config = self.get_config().copy()
 
-        # 隐藏敏感信息（deepseek 与自定义端点的 api_key 均需脱敏）
-        for section_name in ('deepseek', 'custom'):
+        # 隐藏敏感信息（deepseek、智谱与自定义端点的 api_key 均需脱敏）
+        for section_name in ('deepseek', 'custom', 'zhipu'):
             section = config.get(section_name)
             if isinstance(section, dict) and 'api_key' in section:
                 api_key = section['api_key']

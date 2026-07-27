@@ -383,6 +383,107 @@ custom:
         finally:
             os.unlink(temp_path)
 
+    def test_zhipu_cloud_provider_accepted(self):
+        """测试 cloud_provider=zhipu 且 zhipu 含 model 时通过校验（base_url 可留空）"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+ai:
+  type: cloud
+  cloud_provider: zhipu
+
+zhipu:
+  base_url: ""
+  api_key: zhipu-secret-key
+  model: glm-4.6
+  coding_plan: false
+  timeout: 30
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            manager.load_config()
+            assert manager.get_config()['ai']['cloud_provider'] == 'zhipu'
+        finally:
+            os.unlink(temp_path)
+
+    def test_zhipu_cloud_provider_missing_model_rejected(self):
+        """测试 cloud_provider=zhipu 但缺少 model 时被校验拦截"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+ai:
+  type: cloud
+  cloud_provider: zhipu
+
+zhipu:
+  api_key: zhipu-key
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            with pytest.raises(ConfigurationError) as exc_info:
+                manager.load_config()
+            assert 'model' in str(exc_info.value)
+        finally:
+            os.unlink(temp_path)
+
+    def test_zhipu_defaults_and_safe_config(self):
+        """_set_defaults 生成 zhipu 段，且 get_safe_config 对 zhipu.api_key 脱敏"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            manager.load_config()
+            # _set_defaults 应已生成 zhipu 段默认值
+            zhipu = manager.get_config().get('zhipu', {})
+            assert zhipu.get('model') == 'glm-4.6'
+            assert zhipu.get('coding_plan') is False
+            assert zhipu.get('timeout') == 30
+            # 模拟用户填入真实密钥后脱敏
+            manager._config.setdefault('zhipu', {})
+            manager._config['zhipu']['api_key'] = 'sk-zhipu-1234567890abcdef'
+
+            safe = manager.get_safe_config()
+            masked = safe['zhipu']['api_key']
+            assert masked != 'sk-zhipu-1234567890abcdef'  # 已脱敏
+            assert masked.startswith('sk-z') and masked.endswith('cdef')
+            assert '*' in masked
+        finally:
+            os.unlink(temp_path)
+
 
 
 class TestConfigValidationMethods:

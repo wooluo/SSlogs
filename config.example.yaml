@@ -73,7 +73,8 @@ ai_analysis:
 ai:
   type: cloud
   local_provider: ollama
-  # cloud_provider 可选：deepseek（读 deepseek: 段）或 custom（读 custom: 段，任意 OpenAI 兼容端点）
+  # cloud_provider 可选：deepseek（读 deepseek: 段）、custom（读 custom: 段，任意 OpenAI 兼容端点）、
+  # 或 zhipu（读 zhipu: 段，智谱 GLM；支持 GLM Coding Plan 编程套餐端点）
   cloud_provider: deepseek
   max_retries: 3
   retry_delay: 1
@@ -104,6 +105,20 @@ custom:
   base_url: https://api.openai.com/v1   # 例：https://api.openai.com/v1 或 http://localhost:11434/v1
   api_key: ""                            # 留空则读取环境变量 SSLOGS_AI_API_KEY
   model: gpt-4o-mini                     # 任意模型名，可在 GUI 中从 /models 拉取
+  timeout: 30
+  max_tokens: 2048
+
+# 智谱 GLM 配置（当 ai.cloud_provider 设置为 zhipu 时启用）
+# 智谱提供 OpenAI 兼容端点，国内直连。base_url 留空时按 coding_plan 自动派生：
+#   coding_plan=false -> https://open.bigmodel.cn/api/paas/v4      （标准按量计费 API）
+#   coding_plan=true  -> https://open.bigmodel.cn/api/coding/paas/v4（GLM Coding Plan 编程套餐）
+# api_key 建议留空并使用环境变量：export SSLOGS_AI_API_KEY="your-zhipu-api-key"
+# 模型可选：glm-4.6 / glm-4.5 / glm-4-plus / glm-4-flash / glm-4.7-FlashX / glm-5.2 等
+zhipu:
+  base_url: ""        # 留空则按 coding_plan 派生默认端点
+  api_key: ""         # 留空则读取环境变量 SSLOGS_AI_API_KEY
+  model: glm-4.6
+  coding_plan: false  # 开启后走 GLM Coding Plan 专属端点（与套餐 Key 配合）
   timeout: 30
   max_tokens: 2048
 

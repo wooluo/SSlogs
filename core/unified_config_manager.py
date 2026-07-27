@@ -281,6 +281,11 @@ class UnifiedConfigManager(IConfigManager):
                         errors.append("自定义AI配置缺少base_url")
                     if not custom_config.get('model'):
                         errors.append("自定义AI配置缺少model")
+                elif ai_config['cloud_provider'] == 'zhipu':
+                    # 智谱 GLM：要求 model（base_url 可由 coding_plan 派生默认，api_key 可走环境变量）
+                    zhipu_config = config.get('zhipu', {})
+                    if not zhipu_config.get('model'):
+                        errors.append("智谱AI配置缺少model")
 
         # 规则配置验证
         if 'rules' in config:

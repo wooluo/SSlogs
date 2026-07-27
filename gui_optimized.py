@@ -529,7 +529,7 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         model_layout = QHBoxLayout()
         model_layout.addWidget(QLabel("AI模型类型:"))
         self.ai_model_type = QComboBox()
-        self.ai_model_type.addItems(["云端 DeepSeek", "本地 LM Studio", "本地 Ollama", "🌐 自定义 OpenAI 兼容"])
+        self.ai_model_type.addItems(["云端 DeepSeek", "本地 LM Studio", "本地 Ollama", "🌐 自定义 OpenAI 兼容", "🇨🇳 智谱 GLM (Zhipu)"])
         self.ai_model_type.currentTextChanged.connect(self._on_ai_type_changed)
         model_layout.addWidget(self.ai_model_type)
         service_layout.addLayout(model_layout)
@@ -541,6 +541,14 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         self.base_url_input.setPlaceholderText("OpenAI 兼容 base，如 https://api.openai.com/v1")
         base_url_layout.addWidget(self.base_url_input)
         service_layout.addLayout(base_url_layout)
+
+        # 编程套餐开关（仅「智谱 GLM」provider 时可见）
+        # 开启后 base_url 切到智谱专属 coding 端点（/api/coding/paas/v4），与套餐 Key 配合使用。
+        self.zhipu_coding_plan_cb = QCheckBox("🧑‍💻 编程套餐 (Coding Plan) — 走智谱专属端点")
+        self.zhipu_coding_plan_cb.setChecked(False)
+        self.zhipu_coding_plan_cb.setVisible(False)
+        self.zhipu_coding_plan_cb.stateChanged.connect(self._on_zhipu_coding_plan_toggled)
+        service_layout.addWidget(self.zhipu_coding_plan_cb)
 
         # 模型选择
         model_select_layout = QHBoxLayout()
@@ -855,10 +863,53 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         "本地 LM Studio": ("lm_studio", "local", True),
         "本地 Ollama": ("ollama", "local", True),
         "🌐 自定义 OpenAI 兼容": ("custom", "cloud", True),
+        "🇨🇳 智谱 GLM (Zhipu)": ("zhipu", "cloud", True),
     }
 
+    # 智谱 GLM 端点与预置模型（均为 OpenAI 兼容）
+    _ZHIPU_LABEL = "🇨🇳 智谱 GLM (Zhipu)"
+    _ZHIPU_BASE_STANDARD = "https://open.bigmodel.cn/api/paas/v4"
+    _ZHIPU_BASE_CODING = "https://open.bigmodel.cn/api/coding/paas/v4"
+    _ZHIPU_MODELS_STANDARD = [
+        "glm-4.6", "glm-4.5", "glm-4-plus", "glm-4-air", "glm-4-airx",
+        "glm-4-flash", "glm-4-flashx", "glm-4-long", "glm-4",
+    ]
+    _ZHIPU_MODELS_CODING = ["glm-4.6", "glm-4.7-FlashX", "glm-4.5", "glm-5.2"]
+
+    def _is_zhipu_selected(self) -> bool:
+        """当前下拉是否选中智谱 provider。"""
+        return self.ai_model_type.currentText() == self._ZHIPU_LABEL
+
+    def _zhipu_default_base_url(self) -> str:
+        """按当前 Coding Plan 复选框状态返回智谱默认 base_url。"""
+        coding = getattr(self, 'zhipu_coding_plan_cb', None) and self.zhipu_coding_plan_cb.isChecked()
+        return self._ZHIPU_BASE_CODING if coding else self._ZHIPU_BASE_STANDARD
+
+    def _zhipu_curated_models(self) -> list:
+        """按 Coding Plan 状态返回预置模型列表。"""
+        coding = getattr(self, 'zhipu_coding_plan_cb', None) and self.zhipu_coding_plan_cb.isChecked()
+        return list(self._ZHIPU_MODELS_CODING if coding else self._ZHIPU_MODELS_STANDARD)
+
+    def _populate_zhipu_models(self):
+        """用预置模型列表填充下拉（可编辑，保留用户已填模型名）。"""
+        current = self.model_name_combo.currentText()
+        self.model_name_combo.clear()
+        self.model_name_combo.addItems(self._zhipu_curated_models())
+        if current:
+            self.model_name_combo.setCurrentText(current)
+
+    def _on_zhipu_coding_plan_toggled(self, _state: int):
+        """切换 Coding Plan：仅在智谱激活时，把 base_url 在两个端点间切换并刷新模型列表。"""
+        if not self._is_zhipu_selected():
+            return
+        current_url = self.base_url_input.text().strip()
+        # 仅在地址为空或等于某个智谱默认值时自动切换，避免覆盖用户自定义地址
+        if current_url in ("", self._ZHIPU_BASE_STANDARD, self._ZHIPU_BASE_CODING):
+            self.base_url_input.setText(self._zhipu_default_base_url())
+        self._populate_zhipu_models()
+
     def _on_ai_type_changed(self, text: str):
-        """切换 AI 模型类型时，更新 base_url 输入的可用性与占位提示。"""
+        """切换 AI 模型类型时，更新 base_url 输入的可用性、占位提示，及智谱 Coding Plan 开关可见性。"""
         mapping = self._PROVIDER_MAP.get(text)
         self.base_url_input.setEnabled(bool(mapping and mapping[2]))
         placeholders = {
@@ -866,8 +917,19 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
             "本地 LM Studio": "如 http://localhost:1234/v1",
             "云端 DeepSeek": "如 https://api.siliconflow.cn/v1/chat/completions",
             "🌐 自定义 OpenAI 兼容": "OpenAI 兼容 base，如 https://api.openai.com/v1",
+            self._ZHIPU_LABEL: "如 https://open.bigmodel.cn/api/paas/v4",
         }
         self.base_url_input.setPlaceholderText(placeholders.get(text, "API 地址"))
+
+        # Coding Plan 开关仅对智谱可见
+        is_zhipu = text == self._ZHIPU_LABEL
+        if hasattr(self, 'zhipu_coding_plan_cb'):
+            self.zhipu_coding_plan_cb.setVisible(is_zhipu)
+        if is_zhipu:
+            current_url = self.base_url_input.text().strip()
+            if current_url in ("", self._ZHIPU_BASE_STANDARD, self._ZHIPU_BASE_CODING):
+                self.base_url_input.setText(self._zhipu_default_base_url())
+            self._populate_zhipu_models()
 
     def _current_ai_provider(self):
         """返回当前下拉选择的 (provider_name, ai_type)。"""
@@ -991,8 +1053,14 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
 
         # 按当前 provider 读取对应配置段
         section = config.get(cloud_provider, {}) or {}
+        # 智谱：先同步 Coding Plan 开关状态（影响默认 base_url 与模型列表的派生）
+        if cloud_provider == 'zhipu' and hasattr(self, 'zhipu_coding_plan_cb'):
+            self.zhipu_coding_plan_cb.setChecked(bool(section.get('coding_plan', False)))
         if section.get('base_url'):
             self.base_url_input.setText(str(section['base_url']))
+        elif cloud_provider == 'zhipu':
+            # base_url 留空：按 coding_plan 状态填默认端点
+            self.base_url_input.setText(self._zhipu_default_base_url())
         if section.get('api_key'):
             self.api_key_input.setText(str(section['api_key']))
         if section.get('model'):
@@ -1043,6 +1111,15 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
             section['api_key'] = api_key
             if model:
                 section['model'] = model
+            section.setdefault('timeout', 30)
+            section.setdefault('max_tokens', 2048)
+        elif provider == 'zhipu':
+            section = config.setdefault('zhipu', {})
+            section['base_url'] = base_url
+            section['api_key'] = api_key
+            if model:
+                section['model'] = model
+            section['coding_plan'] = bool(self.zhipu_coding_plan_cb.isChecked())
             section.setdefault('timeout', 30)
             section.setdefault('max_tokens', 2048)
         elif provider == 'ollama':
