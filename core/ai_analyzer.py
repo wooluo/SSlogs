@@ -685,7 +685,8 @@ class AIAnalyzer:
             # 处理云端API响应格式
             if 'choices' in result and len(result['choices']) > 0:
                 message = result['choices'][0].get('message', {})
-                content = message.get('content', '')
+                # 部分推理模型（如智谱 GLM-5 系列）把输出放在 reasoning_content，content 可能为空
+                content = message.get('content') or message.get('reasoning_content') or ''
                 if content:
                     return content
                 else:

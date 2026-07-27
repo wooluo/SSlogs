@@ -471,7 +471,8 @@ output_dir: output
             zhipu = manager.get_config().get('zhipu', {})
             assert zhipu.get('model') == 'glm-4.6'
             assert zhipu.get('coding_plan') is False
-            assert zhipu.get('timeout') == 30
+            assert zhipu.get('timeout') == 120   # GLM-5 推理模型较慢，默认更长超时
+            assert zhipu.get('max_tokens') == 4096
             # 模拟用户填入真实密钥后脱敏
             manager._config.setdefault('zhipu', {})
             manager._config['zhipu']['api_key'] = 'sk-zhipu-1234567890abcdef'

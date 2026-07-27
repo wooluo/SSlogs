@@ -119,8 +119,8 @@ zhipu:
   api_key: ""         # 留空则读取环境变量 SSLOGS_AI_API_KEY
   model: glm-4.6
   coding_plan: false  # 开启后走 GLM Coding Plan 专属端点（与套餐 Key 配合）
-  timeout: 30
-  max_tokens: 2048
+  timeout: 120          # GLM-5 等推理模型较慢，需要更长超时
+  max_tokens: 4096  # GLM-5 等推理模型需要更大空间
 
 # LM Studio 配置 (v3.1新增)
 lm_studio:

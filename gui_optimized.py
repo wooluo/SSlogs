@@ -6,6 +6,7 @@ SSlogs v3.1 优化版GUI界面
 
 import sys
 import os
+import re
 import asyncio
 import time
 import threading
@@ -37,6 +38,18 @@ from core import (
     create_error_context, cache_result, CachePolicy
 )
 from core.ai_analyzer import fetch_available_models
+
+
+# 从完整访问日志行中抽取「请求目标」(method + path + query)，仅用于安全校验。
+# 这样可避免把后端 IP(如 192.168.x)、Cookie 分隔符(;)、UA 中的 HTML 实体(&#)等
+# 误判为攻击载荷，显著降低对整行日志校验时的误报。
+_REQUEST_TARGET_RE = re.compile(r'"([A-Z]+)\s+([^"\s]+)\s+HTTP/[\d.]+"')
+
+
+def _extract_request_target(log_line: str) -> str:
+    """提取日志行里的请求方法+路径(含查询串)；提取失败则回退为原行。"""
+    m = _REQUEST_TARGET_RE.search(log_line or '')
+    return f"{m.group(1)} {m.group(2)}" if m else (log_line or '')
 
 
 class AnalysisWorker(QThread):
@@ -75,6 +88,8 @@ class AnalysisWorker(QThread):
             }
 
             self.progress_updated.emit(100, "✅ 分析完成！", performance_data)
+            # 将统计写回 results，供 analysis_completed 读取（否则汇总恒为 0）
+            results['performance'] = performance_data
             self.analysis_finished.emit(True, "分析成功完成", results)
 
         except Exception as e:
@@ -142,8 +157,9 @@ class AnalysisWorker(QThread):
                 try:
                     # 安全验证
                     if security_validation:
-                        validation = validate_input(log_line)
-                        if not validation.is_valid:
+                        validation = validate_input(_extract_request_target(log_line))
+                        # 按「是否检测到威胁」判定（NORMAL 级下 is_valid 恒为 True，会漏计威胁）
+                        if validation.threats or not validation.is_valid:
                             threat_data = {
                                 'line': log_line[:100] + "...",
                                 'threats': validation.threats,
@@ -179,38 +195,81 @@ class AnalysisWorker(QThread):
                         f"📝 已处理 {processed_count} 行日志，内存使用: {memory_usage:.1%}",
                         {'memory_usage': memory_usage, 'processed_count': processed_count})
 
-        # 简化的AI分析（模拟）
-        if ai_enabled and results['processed_logs']:
+        # 真实AI分析（读 config.yaml，支持智谱等 provider）
+        if ai_enabled and (results['threats'] or results['processed_logs']):
             self.progress_updated.emit(85, "🤖 启动AI分析...", {})
-            self._simulate_ai_analysis(results)
+            self._run_ai_analysis(results)
 
         return results
 
-    def _simulate_ai_analysis(self, results):
-        """模拟AI分析（简化版）"""
+    def _run_ai_analysis(self, results):
+        """真实AI分析：用 AIAnalyzer（读 config.yaml，支持智谱等 provider）对检测到的威胁做深度分析。
+
+        结果写入 results['threats'][i]['ai_analysis'] 并实时输出到日志面板。
+        AIAnalyzer.analyze_log 内部已含降级（AI 不可用时返回结构化备用分析），不会中断流程。
+        依赖：分析前请先在 GUI 点「保存AI配置」，让 config.yaml 的 provider/端点/coding_plan 生效。
+        """
         try:
-            # 准备AI分析数据
-            log_count = min(len(results['processed_logs']), 10)  # 限制数量
-
-            for i in range(log_count):
-                if self.is_interrupted:
-                    break
-
-                # 模拟AI分析结果
-                log_entry = results['processed_logs'][i]
-                log_entry['ai_analysis'] = f"AI分析结果 #{i+1}: 威胁等级低，建议持续监控"
-
-                # 模拟处理延迟
-                time.sleep(0.1)  # 短暂延迟模拟
-
-                if i % 3 == 0:  # 每3条更新一次进度
-                    progress = 85 + (i * 15 // log_count)
-                    self.progress_updated.emit(progress, f"🧠 AI分析进度: {i+1}/{log_count}", {})
-
-            self.log_output.emit(f"🧠 AI分析完成，处理了 {log_count} 条日志")
-
+            from core.ai_analyzer import AIAnalyzer
+            config_path = str(Path(__file__).parent / 'config.yaml')
+            analyzer = AIAnalyzer(config_path=config_path)
         except Exception as e:
-            self.log_output.emit(f"⚠️ AI分析失败: {e}")
+            self.log_output.emit(f"⚠️ AI分析器初始化失败: {e}")
+            return
+
+        # 界面上刚填的 Key/模型优先（无需先点保存），端点/coding_plan 沿用 config.yaml 已保存配置
+        gui_key = (self.config.get('api_key') or '').strip()
+        if gui_key:
+            analyzer.api_key = gui_key
+            analyzer.cloud_headers['Authorization'] = f'Bearer {gui_key}'
+        gui_model = (self.config.get('model_name') or '').strip()
+        if gui_model:
+            analyzer.cloud_model = gui_model
+
+        self.log_output.emit(
+            f"🧠 真实AI分析 provider={getattr(analyzer, 'cloud_provider', '?')} "
+            f"model={analyzer.cloud_model or '?'} ..."
+        )
+
+        threats = results.get('threats', [])
+        if not threats:
+            self.log_output.emit("ℹ️ 未检测到威胁，跳过AI分析")
+            return
+
+        # 去重 + 限量，避免对相同攻击重复消耗额度
+        seen, targets = set(), []
+        for th in threats:
+            key = th.get('line', '')
+            if key and key not in seen:
+                seen.add(key)
+                targets.append(th)
+            if len(targets) >= 10:
+                break
+
+        total = len(targets)
+        for i, th in enumerate(targets):
+            if self.is_interrupted:
+                break
+            line = th.get('line', '')
+            names = [getattr(t, 'value', str(t)) for t in th.get('threats', [])]
+            attack_name = ', '.join(names) if names else None
+            try:
+                ai_result = analyzer.analyze_log(
+                    line, attack_name=attack_name, threat_score=th.get('risk_score')
+                )
+            except Exception as e:
+                ai_result = f"⚠️ AI分析异常: {e}"
+            th['ai_analysis'] = ai_result
+
+            # 实时把分析结果输出到日志面板（截断过长内容）
+            preview = ai_result.replace('\n', ' ')[:200]
+            tail = '...' if len(ai_result) > 200 else ''
+            self.log_output.emit(f"🤖 [{attack_name or '威胁'}] {preview}{tail}")
+
+            progress = 85 + int((i + 1) / total * 14)
+            self.progress_updated.emit(min(progress, 99), f"🧠 AI分析进度: {i+1}/{total}", {})
+
+        self.log_output.emit(f"🧠 AI分析完成，共分析 {total} 条威胁")
 
     def _get_memory_usage(self):
         """获取当前内存使用率"""
@@ -297,6 +356,8 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         # 初始化变量
         self.worker = None
         self.start_time = 0
+        self.last_results = None       # 最近一次分析结果，供「导出报告」使用
+        self.last_log_path = ''        # 最近一次分析的日志路径
 
         # 初始化定时器
         self._setup_timers()
@@ -871,10 +932,10 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
     _ZHIPU_BASE_STANDARD = "https://open.bigmodel.cn/api/paas/v4"
     _ZHIPU_BASE_CODING = "https://open.bigmodel.cn/api/coding/paas/v4"
     _ZHIPU_MODELS_STANDARD = [
-        "glm-4.6", "glm-4.5", "glm-4-plus", "glm-4-air", "glm-4-airx",
-        "glm-4-flash", "glm-4-flashx", "glm-4-long", "glm-4",
+        "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.7",
+        "glm-5", "glm-5-turbo", "glm-5.1", "glm-5.2",
     ]
-    _ZHIPU_MODELS_CODING = ["glm-4.6", "glm-4.7-FlashX", "glm-4.5", "glm-5.2"]
+    _ZHIPU_MODELS_CODING = ["glm-4.6", "glm-4.5", "glm-4.7-FlashX", "glm-5.2"]
 
     def _is_zhipu_selected(self) -> bool:
         """当前下拉是否选中智谱 provider。"""
@@ -895,17 +956,16 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         current = self.model_name_combo.currentText()
         self.model_name_combo.clear()
         self.model_name_combo.addItems(self._zhipu_curated_models())
-        if current:
+        # 跳过加载占位符，仅保留真实模型名
+        if current and current not in ("⏳ 正在拉取模型列表...", "正在加载模型列表..."):
             self.model_name_combo.setCurrentText(current)
 
     def _on_zhipu_coding_plan_toggled(self, _state: int):
-        """切换 Coding Plan：仅在智谱激活时，把 base_url 在两个端点间切换并刷新模型列表。"""
+        """切换 Coding Plan：用户显式勾选/取消，直接切到对应官方端点并刷新模型列表。"""
         if not self._is_zhipu_selected():
             return
-        current_url = self.base_url_input.text().strip()
-        # 仅在地址为空或等于某个智谱默认值时自动切换，避免覆盖用户自定义地址
-        if current_url in ("", self._ZHIPU_BASE_STANDARD, self._ZHIPU_BASE_CODING):
-            self.base_url_input.setText(self._zhipu_default_base_url())
+        # 勾选编程套餐是显式动作：直接采用对应官方端点（coding 或 standard）
+        self.base_url_input.setText(self._zhipu_default_base_url())
         self._populate_zhipu_models()
 
     def _on_ai_type_changed(self, text: str):
@@ -927,7 +987,9 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
             self.zhipu_coding_plan_cb.setVisible(is_zhipu)
         if is_zhipu:
             current_url = self.base_url_input.text().strip()
-            if current_url in ("", self._ZHIPU_BASE_STANDARD, self._ZHIPU_BASE_CODING):
+            # 切到智谱时，若当前地址不是智谱端点（可能继承自 deepseek 等其它 provider），
+            # 重置为智谱默认端点；已是智谱端点则保留。
+            if current_url not in (self._ZHIPU_BASE_STANDARD, self._ZHIPU_BASE_CODING):
                 self.base_url_input.setText(self._zhipu_default_base_url())
             self._populate_zhipu_models()
 
@@ -946,6 +1008,15 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
 
         if not base_url:
             QMessageBox.warning(self, "缺少地址", "请先填写 API 地址 (base_url)")
+            return
+
+        # 智谱 /models 需鉴权：未填 API 密钥时直接提示，避免 401 失败把已选模型清空
+        if self._is_zhipu_selected() and not api_key:
+            QMessageBox.warning(
+                self, "缺少 API 密钥",
+                "智谱需要先在「API 密钥」框填入有效 Key 才能拉取模型列表。\n"
+                "也可直接从下拉选择内置模型（glm-4.6 等）或手动输入模型名。"
+            )
             return
 
         self.model_name_combo.clear()
@@ -974,8 +1045,14 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
             self.ai_status_label.setText(f"✅ {message}")
             self.ai_status_label.setStyleSheet("color: #10b981;")
         else:
-            # 拉取失败：下拉仍可手填
-            self.ai_status_label.setText(f"⚠️ {message}")
+            # 拉取失败：智谱恢复内置模型列表，避免下拉被清空；其它 provider 仍可手填
+            if self._is_zhipu_selected():
+                self._populate_zhipu_models()
+                self.ai_status_label.setText(
+                    "⚠️ 拉取失败（多为 API 密钥为空或无效）；已恢复内置模型列表，可直接选择或手动填写"
+                )
+            else:
+                self.ai_status_label.setText(f"⚠️ {message}")
             self.ai_status_label.setStyleSheet("color: #d97706;")
 
     def test_ai_connection(self):
@@ -1120,8 +1197,9 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
             if model:
                 section['model'] = model
             section['coding_plan'] = bool(self.zhipu_coding_plan_cb.isChecked())
-            section.setdefault('timeout', 30)
-            section.setdefault('max_tokens', 2048)
+            # GLM-5 等推理模型需要更长超时与更大 max_tokens；用户若已设更大值则保留
+            section['timeout'] = max(int(section.get('timeout') or 0), 120)
+            section['max_tokens'] = max(int(section.get('max_tokens') or 0), 4096)
         elif provider == 'ollama':
             section = config.setdefault('ollama', {})
             if base_url:
@@ -1219,6 +1297,9 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         if config['ai_enabled'] and not config['model_name']:
             QMessageBox.warning(self, "配置错误", "启用AI分析时需要指定模型名称")
             return
+
+        # 记录本次分析的日志路径，供导出报告使用
+        self.last_log_path = config['log_path']
 
         # 禁用按钮
         self.start_button.setEnabled(False)
@@ -1321,6 +1402,7 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         self.stop_button.setEnabled(False)
 
         if success:
+            self.last_results = results  # 保存结果，供「导出报告」使用
             elapsed = time.time() - self.start_time
             self.append_log(f"✅ 分析完成！总耗时: {elapsed:.1f}秒")
 
@@ -1339,18 +1421,98 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
             QMessageBox.critical(self, "分析失败", message)
 
     def export_report(self):
-        """导出报告"""
+        """把最近一次分析结果导出为 HTML 报告。"""
+        output_dir = self.output_dir_input.text().strip()
+        if not output_dir:
+            QMessageBox.warning(self, "导出失败", "请先配置输出目录")
+            return
+        if not self.last_results:
+            QMessageBox.warning(self, "导出失败", "请先运行一次分析，再导出报告")
+            return
         try:
-            output_dir = self.output_dir_input.text()
-            if not output_dir:
-                QMessageBox.warning(self, "导出失败", "请先配置输出目录")
-                return
-
-            # 这里应该调用实际的报告导出功能
-            QMessageBox.information(self, "导出成功", f"报告已导出到: {output_dir}")
-
+            os.makedirs(output_dir, exist_ok=True)
+            html_doc = self._render_report_html(self.last_results, self.last_log_path)
+            fname = "sslogs-report-" + time.strftime("%Y%m%d-%H%M%S") + ".html"
+            path = os.path.join(output_dir, fname)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html_doc)
+            n = len(self.last_results.get('threats', []))
+            QMessageBox.information(self, "导出成功", f"已导出 {n} 条威胁的报告：\n{path}")
+            self.append_log(f"📄 报告已导出: {path}")
         except Exception as e:
-            QMessageBox.critical(self, "导出失败", f"导出报告时发生错误: {str(e)}")
+            QMessageBox.critical(self, "导出失败", f"导出报告时发生错误: {e}")
+
+    def _render_report_html(self, results, log_path):
+        """根据分析结果渲染一份自包含的 HTML 报告。"""
+        import html as _html
+        from collections import Counter
+        esc = _html.escape
+        perf = results.get('performance', {}) or {}
+        threats = results.get('threats', []) or []
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        # 威胁类型统计
+        type_count = Counter()
+        for t in threats:
+            for x in t.get('threats', []):
+                type_count[getattr(x, 'value', str(x))] += 1
+        type_rows = "".join(f"<tr><td>{esc(k)}</td><td>{v}</td></tr>"
+                            for k, v in type_count.most_common()) or '<tr><td colspan="2">无</td></tr>'
+
+        # 威胁详情卡片
+        cards = []
+        for i, t in enumerate(threats, 1):
+            names = ", ".join(getattr(x, 'value', str(x)) for x in t.get('threats', [])) or "未知"
+            risk = float(t.get('risk_score', 0) or 0)
+            line = esc(t.get('line', ''))
+            ai = t.get('ai_analysis')
+            ai_html = (f'<div class="ai">{esc(ai)}</div>' if ai
+                       else '<div class="ai none">（未进行AI深度分析）</div>')
+            color = '#ef4444' if risk >= 8 else ('#f59e0b' if risk >= 5 else '#3b82f6')
+            cards.append(
+                f'<div class="threat" style="border-left:4px solid {color}">'
+                f'<div class="th-head"><span class="idx">#{i}</span>'
+                f'<span class="typ">{esc(names)}</span>'
+                f'<span class="risk" style="background:{color}">风险 {risk:.1f}</span></div>'
+                f'<div class="line"><code>{line}</code></div>{ai_html}</div>'
+            )
+        detail_html = "".join(cards) or '<p class="empty">未检测到威胁 🎉</p>'
+
+        return f"""<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SSlogs 安全分析报告</title>
+<style>
+ body{{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:24px;color:#1f2937;max-width:1100px}}
+ h1{{color:#111827;border-bottom:2px solid #10b981;padding-bottom:8px}}
+ h3{{margin-top:28px;color:#111827}}
+ .meta{{color:#6b7280;font-size:14px;margin-bottom:16px}}
+ .stat{{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px}}
+ .stat .b{{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px 16px;min-width:120px}}
+ .stat .n{{font-size:22px;font-weight:700;color:#111827}} .stat .l{{font-size:12px;color:#6b7280}}
+ table{{border-collapse:collapse;margin:8px 0;font-size:14px}}
+ td,th{{border:1px solid #e5e7eb;padding:6px 10px}} th{{background:#f3f4f6;text-align:left}}
+ .threat{{background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:10px 12px;margin:10px 0}}
+ .th-head{{display:flex;gap:8px;align-items:center;margin-bottom:6px;font-weight:600;font-size:14px}}
+ .idx{{color:#9ca3af}} .risk{{color:#fff;padding:2px 8px;border-radius:10px;font-size:12px}}
+ .line code{{word-break:break-all;background:#f3f4f6;padding:4px 6px;border-radius:4px;font-size:12px;display:block}}
+ .ai{{margin-top:8px;padding:8px 10px;background:#f0fdf4;border-radius:4px;white-space:pre-wrap;font-size:13px;border:1px solid #bbf7d0;line-height:1.6}}
+ .ai.none{{background:#f9fafb;border-color:#e5e7eb;color:#9ca3af}}
+ .empty{{color:#10b981;font-size:16px}}
+</style></head><body>
+<h1>🛡️ SSlogs 安全分析报告</h1>
+<div class="meta">日志: {esc(log_path or '未知')}　|　生成时间: {ts}</div>
+<div class="stat">
+ <div class="b"><div class="n">{perf.get('processed_count', 0)}</div><div class="l">处理日志条数</div></div>
+ <div class="b"><div class="n">{len(threats)}</div><div class="l">威胁条数</div></div>
+ <div class="b"><div class="n">{perf.get('total_time', 0):.1f}s</div><div class="l">耗时</div></div>
+ <div class="b"><div class="n">{perf.get('memory_peak', 0):.1f}%</div><div class="l">内存峰值</div></div>
+</div>
+<h3>威胁类型分布</h3>
+<table><tr><th>类型</th><th>次数</th></tr>{type_rows}</table>
+<h3>威胁详情（{len(threats)} 条）</h3>
+{detail_html}
+</body></html>"""
 
 
 def main():

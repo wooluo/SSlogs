@@ -112,6 +112,8 @@ coverage.xml
 api_keys.txt
 secrets.json
 private_config.yaml
+# config.yaml 含本地真实 API Key（如智谱），不提交；从 config.example.yaml 复制生成
+config.yaml
 
 # MaxMind GeoIP configuration with real credentials
 config/GeoIP.conf.local

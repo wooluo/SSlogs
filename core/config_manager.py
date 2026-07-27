@@ -332,8 +332,8 @@ class ConfigManager:
         zhipu.setdefault('api_key', '')           # 留空则读取环境变量 SSLOGS_AI_API_KEY
         zhipu.setdefault('model', 'glm-4.6')
         zhipu.setdefault('coding_plan', False)
-        zhipu.setdefault('timeout', 30)
-        zhipu.setdefault('max_tokens', 2048)
+        zhipu.setdefault('timeout', 120)
+        zhipu.setdefault('max_tokens', 4096)      # GLM-5 等推理模型需要更大空间产出正式回答
 
         # 重试配置默认值
         ai.setdefault('max_retries', 3)
