@@ -2,8 +2,9 @@
 AI分析器单元测试
 """
 import pytest
+import requests
 from unittest.mock import Mock, patch, MagicMock
-from core.ai_analyzer import AIAnalyzer
+from core.ai_analyzer import AIAnalyzer, fetch_available_models
 from core.exceptions import (
     AIServiceError,
     AIServiceUnavailableError,
@@ -460,3 +461,190 @@ class TestSpecializedPrompts:
         )
         assert '攻击技术分析' in prompt
         assert '影响范围评估' in prompt
+
+
+class TestCustomCloudProvider:
+    """自定义 OpenAI 兼容云端 provider 测试 (cloud_provider='custom')"""
+
+    @pytest.fixture
+    def analyzer(self):
+        """创建配置为 custom provider 的分析器"""
+        config = {
+            'ai': {'type': 'cloud', 'cloud_provider': 'custom'},
+            'custom': {
+                'api_key': 'custom-key',
+                'base_url': 'https://api.openai.com/v1',
+                'model': 'gpt-4o-mini',
+                'timeout': 15,
+                'max_tokens': 500
+            }
+        }
+        with patch('core.ai_analyzer.AIAnalyzer._load_config', return_value=config):
+            with patch('core.ai_analyzer.AIAnalyzer._init_http_session'):
+                return AIAnalyzer(config_path='dummy')
+
+    def test_custom_provider_config_loaded(self, analyzer):
+        """custom provider 正确加载 custom: 配置段"""
+        assert analyzer.cloud_provider == 'custom'
+        assert analyzer.cloud_model == 'gpt-4o-mini'
+        assert analyzer.cloud_base_url == 'https://api.openai.com/v1'
+        assert analyzer.api_key == 'custom-key'
+        assert analyzer.cloud_max_tokens == 500
+        assert analyzer.cloud_timeout == 15
+
+    def test_custom_chat_and_models_url_derivation(self, analyzer):
+        """base_url 为 base 形式时派生正确的 chat / models 端点"""
+        assert analyzer._chat_url() == 'https://api.openai.com/v1/chat/completions'
+        assert analyzer._models_url() == 'https://api.openai.com/v1/models'
+
+    @patch('core.ai_analyzer.requests.post')
+    def test_analyze_with_custom_success(self, mock_post, analyzer):
+        """自定义 provider 成功调用云端分析（mock requests.post，避免真实网络）"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            'choices': [{'message': {'content': '自定义分析结果'}}]
+        }
+        mock_post.return_value = mock_response
+
+        result = analyzer._analyze_with_cloud('测试日志内容')
+
+        assert result == '自定义分析结果'
+        mock_post.assert_called_once()
+        # 请求 URL 应为派生的 chat 端点
+        assert mock_post.call_args.args[0] == 'https://api.openai.com/v1/chat/completions'
+        # payload 应使用 custom 的 model 与 max_tokens
+        payload = mock_post.call_args.kwargs['json']
+        assert payload['model'] == 'gpt-4o-mini'
+        assert payload['max_tokens'] == 500
+
+    @patch('core.ai_analyzer.requests.post')
+    def test_analyze_with_custom_no_api_key(self, mock_post, analyzer):
+        """custom provider 缺少 api_key 时抛出认证错误"""
+        analyzer.api_key = ''
+        with pytest.raises(AIAuthenticationError):
+            analyzer._analyze_with_cloud('测试日志内容')
+        mock_post.assert_not_called()
+
+
+class TestZhipuCloudProvider:
+    """智谱 GLM 云端 provider 测试 (cloud_provider='zhipu')"""
+
+    @staticmethod
+    def _make_analyzer(coding_plan=False, base_url='', api_key='zhipu-key'):
+        """构造一个智谱 provider 分析器（patch 掉配置加载与 HTTP 会话初始化）"""
+        config = {
+            'ai': {'type': 'cloud', 'cloud_provider': 'zhipu'},
+            'zhipu': {
+                'api_key': api_key,
+                'model': 'glm-4.6',
+                'coding_plan': coding_plan,
+                'base_url': base_url,
+                'timeout': 20,
+                'max_tokens': 800
+            }
+        }
+        with patch('core.ai_analyzer.AIAnalyzer._load_config', return_value=config):
+            with patch('core.ai_analyzer.AIAnalyzer._init_http_session'):
+                return AIAnalyzer(config_path='dummy')
+
+    @pytest.fixture
+    def analyzer(self):
+        """标准端点（coding_plan=False）的智谱分析器"""
+        return self._make_analyzer(coding_plan=False)
+
+    def test_zhipu_provider_config_loaded(self, analyzer):
+        """智谱 provider 正确加载 zhipu: 配置段（标准端点）"""
+        assert analyzer.cloud_provider == 'zhipu'
+        assert analyzer.cloud_model == 'glm-4.6'
+        assert analyzer.api_key == 'zhipu-key'
+        assert analyzer.cloud_max_tokens == 800
+        assert analyzer.cloud_timeout == 20
+        # base_url 留空 + coding_plan=False -> 派生标准端点
+        assert analyzer.cloud_base_url == 'https://open.bigmodel.cn/api/paas/v4'
+        # OpenAI 兼容的 Bearer 鉴权
+        assert analyzer.cloud_headers['Authorization'] == 'Bearer zhipu-key'
+
+    def test_zhipu_standard_chat_url(self, analyzer):
+        """标准端点派生正确的 chat / models 地址"""
+        assert analyzer._chat_url() == 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+        assert analyzer._models_url() == 'https://open.bigmodel.cn/api/paas/v4/models'
+
+    def test_zhipu_coding_plan_endpoint(self):
+        """coding_plan=True 时 base_url 派生为编程套餐专属端点"""
+        a = self._make_analyzer(coding_plan=True)
+        assert a.cloud_base_url == 'https://open.bigmodel.cn/api/coding/paas/v4'
+        assert a._chat_url() == 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions'
+
+    def test_zhipu_explicit_base_url_wins(self):
+        """显式配置的 base_url 优先于 coding_plan 派生值"""
+        a = self._make_analyzer(coding_plan=True, base_url='https://example.com/v1')
+        assert a.cloud_base_url == 'https://example.com/v1'
+
+    @patch('core.ai_analyzer.requests.post')
+    def test_analyze_with_zhipu_success(self, mock_post, analyzer):
+        """智谱 provider 成功调用云端分析（mock requests.post，避免真实网络）"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            'choices': [{'message': {'content': '智谱分析结果'}}]
+        }
+        mock_post.return_value = mock_response
+
+        result = analyzer._analyze_with_cloud('测试日志内容')
+
+        assert result == '智谱分析结果'
+        mock_post.assert_called_once()
+        # 请求 URL 为派生的标准端点 chat 地址
+        assert mock_post.call_args.args[0] == 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+        payload = mock_post.call_args.kwargs['json']
+        assert payload['model'] == 'glm-4.6'
+
+
+class TestFetchAvailableModels:
+    """fetch_available_models 模块函数测试"""
+
+    @patch('core.ai_analyzer.requests.get')
+    def test_fetch_models_success(self, mock_get):
+        """成功拉取模型列表，并带 Bearer 认证"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            'data': [{'id': 'gpt-4o'}, {'id': 'gpt-4o-mini'}, {'no_id': True}]
+        }
+        mock_get.return_value = mock_response
+
+        models = fetch_available_models('https://api.openai.com/v1', api_key='sk-xxx')
+
+        assert models == ['gpt-4o', 'gpt-4o-mini']
+        # URL 派生为 /models
+        assert mock_get.call_args.args[0] == 'https://api.openai.com/v1/models'
+        # 请求头带 Bearer
+        assert mock_get.call_args.kwargs['headers']['Authorization'] == 'Bearer sk-xxx'
+
+    @patch('core.ai_analyzer.requests.get')
+    def test_fetch_models_from_full_chat_url(self, mock_get):
+        """base_url 为完整 chat 地址时也能正确派生 /models"""
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {'data': [{'id': 'm1'}]}
+        mock_get.return_value = mock_response
+
+        models = fetch_available_models('https://api.siliconflow.cn/v1/chat/completions')
+
+        assert models == ['m1']
+        assert mock_get.call_args.args[0] == 'https://api.siliconflow.cn/v1/models'
+
+    def test_fetch_models_empty_url(self):
+        """空 base_url 返回空列表"""
+        assert fetch_available_models('') == []
+
+    @patch('core.ai_analyzer.requests.get')
+    def test_fetch_models_failure_returns_empty(self, mock_get):
+        """网络/HTTP 错误时返回空列表，不抛异常"""
+        mock_get.side_effect = requests.exceptions.ConnectionError('boom')
+        assert fetch_available_models('https://api.openai.com/v1') == []
+

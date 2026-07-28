@@ -3,10 +3,71 @@ import requests
 import logging
 import yaml
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .exceptions import AIServiceError, AIServiceUnavailableError, AIAuthenticationError, AIRateLimitError
+
+
+def _derive_chat_url(base_url: str) -> str:
+    """从 base_url 派生 chat completions 端点。
+
+    兼容两种写法：
+    - 完整地址（含 /chat/completions，如旧版 deepseek 段）-> 原样返回
+    - 仅 base（如 https://api.openai.com/v1）-> 追加 /chat/completions
+    """
+    base = (base_url or '').strip()
+    if not base:
+        return ''
+    if base.rstrip('/').endswith('/chat/completions'):
+        return base
+    return base.rstrip('/') + '/chat/completions'
+
+
+def _derive_models_url(base_url: str) -> str:
+    """从 base_url 派生 GET /models 端点（去掉可能的 /chat/completions 后缀）。"""
+    base = (base_url or '').strip()
+    if not base:
+        return ''
+    if base.rstrip('/').endswith('/chat/completions'):
+        base = base.rstrip('/')[:-len('/chat/completions')]
+    return base.rstrip('/') + '/models'
+
+
+def fetch_available_models(base_url: str, api_key: str = '', timeout: int = 10) -> List[str]:
+    """从任意 OpenAI 兼容端点拉取可用模型列表（GET /models）。
+
+    base_url 可以是 base（如 https://api.openai.com/v1）或完整 chat completions 地址，
+    函数会自动派生 /models 端点。失败时返回空列表（不抛异常），便于 GUI 下拉容错。
+
+    Args:
+        base_url: OpenAI 兼容 API 的 base 地址
+        api_key: 可选的 API 密钥（Bearer 认证）
+        timeout: 请求超时秒数
+
+    Returns:
+        可用模型 id 列表；失败时返回空列表
+    """
+    logger = logging.getLogger('core.ai_analyzer')
+    models_url = _derive_models_url(base_url)
+    if not models_url:
+        logger.warning("fetch_available_models: base_url 为空")
+        return []
+
+    headers = {'Content-Type': 'application/json'}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+
+    try:
+        response = requests.get(models_url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        models = [m.get('id') for m in data.get('data', []) if m.get('id')]
+        logger.info(f"从 {models_url} 获取到 {len(models)} 个模型")
+        return models
+    except Exception as e:
+        logger.warning(f"拉取模型列表失败 ({models_url}): {e}")
+        return []
 
 
 class AIAnalyzer:
@@ -36,17 +97,8 @@ class AIAnalyzer:
         # 初始化HTTP会话（连接池优化）
         self._init_http_session()
 
-        # 加载云端模型配置
-        if self.cloud_provider == 'deepseek':
-            self.deepseek_config = self.config.get('deepseek', {})
-            # 优先从环境变量获取API密钥，提高安全性
-            self.api_key = self._get_secure_api_key()
-            self.cloud_model = self.deepseek_config.get('model', 'deepseek-ai/DeepSeek-V3')
-            self.cloud_base_url = self.deepseek_config.get('base_url', 'https://api.siliconflow.cn/v1/chat/completions')
-            self.cloud_headers = {
-                'Authorization': f'Bearer {self.api_key}',
-                'Content-Type': 'application/json'
-            }
+        # 加载云端模型配置（支持 deepseek 与任意 OpenAI 兼容的 custom 端点）
+        self._load_cloud_config()
 
         # 加载本地模型配置
         if self.local_provider == 'ollama':
@@ -88,22 +140,87 @@ class AIAnalyzer:
         # 其次使用配置文件
         return self.config.get(section, {}).get(key, default)
     
-    def _get_secure_api_key(self) -> str:
-        """安全地获取API密钥，优先从环境变量读取"""
+    def _get_secure_api_key(self, config_section: Optional[Dict[str, Any]] = None) -> str:
+        """安全地获取API密钥，优先从环境变量读取
+
+        Args:
+            config_section: 当前 provider 的配置段（如 deepseek/custom）。
+                为 None 时回退到 self.deepseek_config，保持向后兼容。
+        """
         # 1. 首先检查环境变量
         env_api_key = os.environ.get(self.ENV_API_KEY)
         if env_api_key:
             self.logger.debug("从环境变量获取API密钥")
             return env_api_key
-        
+
         # 2. 其次从配置文件读取
-        config_api_key = self.deepseek_config.get('api_key', '')
+        if config_section is None:
+            config_section = getattr(self, 'deepseek_config', {}) or {}
+        config_api_key = config_section.get('api_key', '')
         if config_api_key and config_api_key not in ['your-api-key-here', 'YOUR_API_KEY', 'demo_key_for_testing', '']:
             self.logger.debug("从配置文件获取API密钥")
             return config_api_key
-        
+
         self.logger.warning("API密钥未配置，请设置环境变量 SSLOGS_AI_API_KEY 或修改配置文件")
         return ''
+
+    def _load_cloud_config(self):
+        """加载云端 provider 配置。
+
+        支持三种云端 provider，三者均使用 OpenAI Chat Completions 协议：
+        - 'deepseek'：读取 deepseek: 段（向后兼容）
+        - 'custom'：读取 custom: 段，可指向任意 OpenAI 兼容端点（base_url + api_key + model）
+        - 'zhipu'：读取 zhipu: 段（智谱 GLM）；coding_plan=True 时默认走编程套餐端点
+
+        三种 provider 都填充同一组属性：self.cloud_model / cloud_base_url /
+        cloud_headers / api_key / cloud_max_tokens / cloud_timeout。
+        """
+        if self.cloud_provider == 'deepseek':
+            section = self.config.get('deepseek', {})
+            default_base_url = 'https://api.siliconflow.cn/v1/chat/completions'
+            default_model = 'deepseek-ai/DeepSeek-V3'
+            self.deepseek_config = section
+        elif self.cloud_provider == 'custom':
+            section = self.config.get('custom', {})
+            default_base_url = ''   # custom 必须显式配置 base_url
+            default_model = ''
+            self.custom_config = section
+        elif self.cloud_provider == 'zhipu':
+            section = self.config.get('zhipu', {})
+            coding_plan = bool(section.get('coding_plan', False))
+            # 智谱均为 OpenAI 兼容端点；编程套餐(coding_plan)走专属 coding 端点
+            default_base_url = ('https://open.bigmodel.cn/api/coding/paas/v4'
+                                if coding_plan else 'https://open.bigmodel.cn/api/paas/v4')
+            default_model = 'glm-4.6'
+            self.zhipu_config = section
+        else:
+            # 未支持的云端 provider：置空云端配置，避免误用
+            self.api_key = ''
+            self.cloud_model = ''
+            self.cloud_base_url = ''
+            self.cloud_headers = {'Content-Type': 'application/json'}
+            self.cloud_max_tokens = 1024
+            self.cloud_timeout = self.default_timeout
+            return
+
+        self.api_key = self._get_secure_api_key(section)
+        self.cloud_model = section.get('model', default_model)
+        # base_url 为空字符串或缺省时回退到默认端点（智谱据此按 coding_plan 派生默认端点）
+        self.cloud_base_url = section.get('base_url') or default_base_url
+        self.cloud_headers = {
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/json'
+        }
+        self.cloud_max_tokens = section.get('max_tokens', 1024)
+        self.cloud_timeout = section.get('timeout', self.default_timeout)
+
+    def _chat_url(self) -> str:
+        """云端 chat completions 地址（兼容 base_url 含/不含 /chat/completions）。"""
+        return _derive_chat_url(self.cloud_base_url)
+
+    def _models_url(self) -> str:
+        """云端 GET /models 地址。"""
+        return _derive_models_url(self.cloud_base_url)
 
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         try:
@@ -550,7 +667,7 @@ class AIAnalyzer:
         payload = {
             "model": self.cloud_model,
             "stream": False,
-            "max_tokens": self.deepseek_config.get('max_tokens', 1024),
+            "max_tokens": self.cloud_max_tokens,
             "temperature": 0.7,
             "top_p": 0.7,
             "messages": [{"role": "user", "content": prompt}]
@@ -558,17 +675,18 @@ class AIAnalyzer:
 
         try:
             response = self._make_request_with_retry(
-                self.cloud_base_url,
+                self._chat_url(),
                 self.cloud_headers,
                 payload,
-                self.deepseek_config.get('timeout', 30)
+                self.cloud_timeout
             )
             result = response.json()
 
             # 处理云端API响应格式
             if 'choices' in result and len(result['choices']) > 0:
                 message = result['choices'][0].get('message', {})
-                content = message.get('content', '')
+                # 部分推理模型（如智谱 GLM-5 系列）把输出放在 reasoning_content，content 可能为空
+                content = message.get('content') or message.get('reasoning_content') or ''
                 if content:
                     return content
                 else:
@@ -646,12 +764,12 @@ class AIAnalyzer:
             "model": self.cloud_model,
             "messages": [{"role": "user", "content": prompt}]
         }
-        
+
         response = self._make_request_with_retry(
-            self.cloud_base_url,
+            self._chat_url(),
             self.cloud_headers,
             payload,
-            self.deepseek_config.get('timeout', 60)
+            self.cloud_timeout
         )
         result = response.json()
         return result.get("choices", [{}])[0].get("message", {}).get("content", "")

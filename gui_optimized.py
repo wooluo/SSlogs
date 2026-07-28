@@ -6,9 +6,12 @@ SSlogs v3.1 优化版GUI界面
 
 import sys
 import os
+import re
 import asyncio
 import time
 import threading
+import yaml
+import requests
 from pathlib import Path
 
 # 添加项目根目录到Python路径
@@ -22,7 +25,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QSplitter, QFrame, QScrollArea,
     QDialog, QDialogButtonBox, QFormLayout
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QFont, QPixmap, QIcon, QColor, QPalette
 
 # 导入优化后的核心模块
@@ -34,6 +37,19 @@ from core import (
     validate_input, sanitize_input, handle_exceptions,
     create_error_context, cache_result, CachePolicy
 )
+from core.ai_analyzer import fetch_available_models
+
+
+# 从完整访问日志行中抽取「请求目标」(method + path + query)，仅用于安全校验。
+# 这样可避免把后端 IP(如 192.168.x)、Cookie 分隔符(;)、UA 中的 HTML 实体(&#)等
+# 误判为攻击载荷，显著降低对整行日志校验时的误报。
+_REQUEST_TARGET_RE = re.compile(r'"([A-Z]+)\s+([^"\s]+)\s+HTTP/[\d.]+"')
+
+
+def _extract_request_target(log_line: str) -> str:
+    """提取日志行里的请求方法+路径(含查询串)；提取失败则回退为原行。"""
+    m = _REQUEST_TARGET_RE.search(log_line or '')
+    return f"{m.group(1)} {m.group(2)}" if m else (log_line or '')
 
 
 class AnalysisWorker(QThread):
@@ -72,6 +88,8 @@ class AnalysisWorker(QThread):
             }
 
             self.progress_updated.emit(100, "✅ 分析完成！", performance_data)
+            # 将统计写回 results，供 analysis_completed 读取（否则汇总恒为 0）
+            results['performance'] = performance_data
             self.analysis_finished.emit(True, "分析成功完成", results)
 
         except Exception as e:
@@ -139,8 +157,9 @@ class AnalysisWorker(QThread):
                 try:
                     # 安全验证
                     if security_validation:
-                        validation = validate_input(log_line)
-                        if not validation.is_valid:
+                        validation = validate_input(_extract_request_target(log_line))
+                        # 按「是否检测到威胁」判定（NORMAL 级下 is_valid 恒为 True，会漏计威胁）
+                        if validation.threats or not validation.is_valid:
                             threat_data = {
                                 'line': log_line[:100] + "...",
                                 'threats': validation.threats,
@@ -176,38 +195,81 @@ class AnalysisWorker(QThread):
                         f"📝 已处理 {processed_count} 行日志，内存使用: {memory_usage:.1%}",
                         {'memory_usage': memory_usage, 'processed_count': processed_count})
 
-        # 简化的AI分析（模拟）
-        if ai_enabled and results['processed_logs']:
+        # 真实AI分析（读 config.yaml，支持智谱等 provider）
+        if ai_enabled and (results['threats'] or results['processed_logs']):
             self.progress_updated.emit(85, "🤖 启动AI分析...", {})
-            self._simulate_ai_analysis(results)
+            self._run_ai_analysis(results)
 
         return results
 
-    def _simulate_ai_analysis(self, results):
-        """模拟AI分析（简化版）"""
+    def _run_ai_analysis(self, results):
+        """真实AI分析：用 AIAnalyzer（读 config.yaml，支持智谱等 provider）对检测到的威胁做深度分析。
+
+        结果写入 results['threats'][i]['ai_analysis'] 并实时输出到日志面板。
+        AIAnalyzer.analyze_log 内部已含降级（AI 不可用时返回结构化备用分析），不会中断流程。
+        依赖：分析前请先在 GUI 点「保存AI配置」，让 config.yaml 的 provider/端点/coding_plan 生效。
+        """
         try:
-            # 准备AI分析数据
-            log_count = min(len(results['processed_logs']), 10)  # 限制数量
-
-            for i in range(log_count):
-                if self.is_interrupted:
-                    break
-
-                # 模拟AI分析结果
-                log_entry = results['processed_logs'][i]
-                log_entry['ai_analysis'] = f"AI分析结果 #{i+1}: 威胁等级低，建议持续监控"
-
-                # 模拟处理延迟
-                time.sleep(0.1)  # 短暂延迟模拟
-
-                if i % 3 == 0:  # 每3条更新一次进度
-                    progress = 85 + (i * 15 // log_count)
-                    self.progress_updated.emit(progress, f"🧠 AI分析进度: {i+1}/{log_count}", {})
-
-            self.log_output.emit(f"🧠 AI分析完成，处理了 {log_count} 条日志")
-
+            from core.ai_analyzer import AIAnalyzer
+            config_path = str(Path(__file__).parent / 'config.yaml')
+            analyzer = AIAnalyzer(config_path=config_path)
         except Exception as e:
-            self.log_output.emit(f"⚠️ AI分析失败: {e}")
+            self.log_output.emit(f"⚠️ AI分析器初始化失败: {e}")
+            return
+
+        # 界面上刚填的 Key/模型优先（无需先点保存），端点/coding_plan 沿用 config.yaml 已保存配置
+        gui_key = (self.config.get('api_key') or '').strip()
+        if gui_key:
+            analyzer.api_key = gui_key
+            analyzer.cloud_headers['Authorization'] = f'Bearer {gui_key}'
+        gui_model = (self.config.get('model_name') or '').strip()
+        if gui_model:
+            analyzer.cloud_model = gui_model
+
+        self.log_output.emit(
+            f"🧠 真实AI分析 provider={getattr(analyzer, 'cloud_provider', '?')} "
+            f"model={analyzer.cloud_model or '?'} ..."
+        )
+
+        threats = results.get('threats', [])
+        if not threats:
+            self.log_output.emit("ℹ️ 未检测到威胁，跳过AI分析")
+            return
+
+        # 去重 + 限量，避免对相同攻击重复消耗额度
+        seen, targets = set(), []
+        for th in threats:
+            key = th.get('line', '')
+            if key and key not in seen:
+                seen.add(key)
+                targets.append(th)
+            if len(targets) >= 10:
+                break
+
+        total = len(targets)
+        for i, th in enumerate(targets):
+            if self.is_interrupted:
+                break
+            line = th.get('line', '')
+            names = [getattr(t, 'value', str(t)) for t in th.get('threats', [])]
+            attack_name = ', '.join(names) if names else None
+            try:
+                ai_result = analyzer.analyze_log(
+                    line, attack_name=attack_name, threat_score=th.get('risk_score')
+                )
+            except Exception as e:
+                ai_result = f"⚠️ AI分析异常: {e}"
+            th['ai_analysis'] = ai_result
+
+            # 实时把分析结果输出到日志面板（截断过长内容）
+            preview = ai_result.replace('\n', ' ')[:200]
+            tail = '...' if len(ai_result) > 200 else ''
+            self.log_output.emit(f"🤖 [{attack_name or '威胁'}] {preview}{tail}")
+
+            progress = 85 + int((i + 1) / total * 14)
+            self.progress_updated.emit(min(progress, 99), f"🧠 AI分析进度: {i+1}/{total}", {})
+
+        self.log_output.emit(f"🧠 AI分析完成，共分析 {total} 条威胁")
 
     def _get_memory_usage(self):
         """获取当前内存使用率"""
@@ -238,13 +300,41 @@ class AnalysisWorker(QThread):
         self.log_output.emit("⏹️ 用户中断分析...")
 
 
+class _BackgroundAIWorker(QThread):
+    """在后台线程运行 AI 网络任务（拉取模型 / 测试连接），避免阻塞 UI。
+
+    task 是一个无参 callable，返回 (ok: bool, message: str, payload)。
+    结果通过 result_ready 信号回传到主线程。
+    """
+    result_ready = pyqtSignal(bool, str, object)
+
+    def __init__(self, task):
+        super().__init__()
+        self._task = task
+
+    def run(self):
+        try:
+            ok, message, payload = self._task()
+        except Exception as e:
+            ok, message, payload = False, f"请求异常: {e}", None
+        self.result_ready.emit(bool(ok), str(message), payload)
+
+
 class OptimizedLogAnalyzerGUI(QMainWindow):
     """SSlogs v3.1 优化版GUI界面"""
+
+    # AI 模型类型下拉项与 cloud_provider 的映射
+    _AI_TYPE_CLOUD = "🌐 自定义 OpenAI 兼容"
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("🚀 SSlogs v3.1 - 企业级智能安全日志分析平台")
         self.setGeometry(100, 100, 1200, 900)
+
+        # 配置文件路径（项目根目录下的 config.yaml）
+        self.config_path = str(Path(__file__).parent / 'config.yaml')
+        # 后台 AI 网络任务句柄（防止被 GC 回收）
+        self._ai_worker = None
 
         # 设置应用图标和样式
         self._setup_appearance()
@@ -266,9 +356,14 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         # 初始化变量
         self.worker = None
         self.start_time = 0
+        self.last_results = None       # 最近一次分析结果，供「导出报告」使用
+        self.last_log_path = ''        # 最近一次分析的日志路径
 
         # 初始化定时器
         self._setup_timers()
+
+        # 从 config.yaml 回填 AI 配置到界面
+        self._load_ai_config_from_yaml()
 
     def _setup_appearance(self):
         """设置界面外观"""
@@ -495,9 +590,26 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         model_layout = QHBoxLayout()
         model_layout.addWidget(QLabel("AI模型类型:"))
         self.ai_model_type = QComboBox()
-        self.ai_model_type.addItems(["云端 DeepSeek", "本地 LM Studio", "本地 Ollama"])
+        self.ai_model_type.addItems(["云端 DeepSeek", "本地 LM Studio", "本地 Ollama", "🌐 自定义 OpenAI 兼容", "🇨🇳 智谱 GLM (Zhipu)"])
+        self.ai_model_type.currentTextChanged.connect(self._on_ai_type_changed)
         model_layout.addWidget(self.ai_model_type)
         service_layout.addLayout(model_layout)
+
+        # API基础URL（自定义/OpenAI 兼容端点）
+        base_url_layout = QHBoxLayout()
+        base_url_layout.addWidget(QLabel("API地址:"))
+        self.base_url_input = QLineEdit()
+        self.base_url_input.setPlaceholderText("OpenAI 兼容 base，如 https://api.openai.com/v1")
+        base_url_layout.addWidget(self.base_url_input)
+        service_layout.addLayout(base_url_layout)
+
+        # 编程套餐开关（仅「智谱 GLM」provider 时可见）
+        # 开启后 base_url 切到智谱专属 coding 端点（/api/coding/paas/v4），与套餐 Key 配合使用。
+        self.zhipu_coding_plan_cb = QCheckBox("🧑‍💻 编程套餐 (Coding Plan) — 走智谱专属端点")
+        self.zhipu_coding_plan_cb.setChecked(False)
+        self.zhipu_coding_plan_cb.setVisible(False)
+        self.zhipu_coding_plan_cb.stateChanged.connect(self._on_zhipu_coding_plan_toggled)
+        service_layout.addWidget(self.zhipu_coding_plan_cb)
 
         # 模型选择
         model_select_layout = QHBoxLayout()
@@ -516,7 +628,7 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         api_layout.addWidget(QLabel("API密钥:"))
         self.api_key_input = QLineEdit()
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_input.setPlaceholderText("云端服务API密钥")
+        self.api_key_input.setPlaceholderText("云端服务API密钥（可改用环境变量 SSLOGS_AI_API_KEY）")
         api_layout.addWidget(self.api_key_input)
         service_layout.addLayout(api_layout)
 
@@ -534,12 +646,18 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         parent_layout.addWidget(service_group)
 
         # 测试区域
-        test_group = QGroupBox("🧪 连接测试")
+        test_group = QGroupBox("🧪 连接与配置")
         test_layout = QVBoxLayout()
 
+        test_action_layout = QHBoxLayout()
         test_btn = QPushButton("测试AI连接")
         test_btn.clicked.connect(self.test_ai_connection)
-        test_layout.addWidget(test_btn)
+        test_action_layout.addWidget(test_btn)
+
+        save_ai_btn = QPushButton("💾 保存AI配置")
+        save_ai_btn.clicked.connect(self._save_ai_config_to_yaml)
+        test_action_layout.addWidget(save_ai_btn)
+        test_layout.addLayout(test_action_layout)
 
         self.ai_status_label = QLabel("状态: 未测试")
         test_layout.addWidget(self.ai_status_label)
@@ -800,49 +918,316 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         if directory:
             self.output_dir_input.setText(directory)
 
-    def refresh_models(self):
-        """刷新AI模型列表"""
+    # 下拉文本 -> (cloud_provider/local_provider, ai.type, 是否需要 base_url)
+    _PROVIDER_MAP = {
+        "云端 DeepSeek": ("deepseek", "cloud", True),
+        "本地 LM Studio": ("lm_studio", "local", True),
+        "本地 Ollama": ("ollama", "local", True),
+        "🌐 自定义 OpenAI 兼容": ("custom", "cloud", True),
+        "🇨🇳 智谱 GLM (Zhipu)": ("zhipu", "cloud", True),
+    }
+
+    # 智谱 GLM 端点与预置模型（均为 OpenAI 兼容）
+    _ZHIPU_LABEL = "🇨🇳 智谱 GLM (Zhipu)"
+    _ZHIPU_BASE_STANDARD = "https://open.bigmodel.cn/api/paas/v4"
+    _ZHIPU_BASE_CODING = "https://open.bigmodel.cn/api/coding/paas/v4"
+    _ZHIPU_MODELS_STANDARD = [
+        "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.7",
+        "glm-5", "glm-5-turbo", "glm-5.1", "glm-5.2",
+    ]
+    _ZHIPU_MODELS_CODING = ["glm-4.6", "glm-4.5", "glm-4.7-FlashX", "glm-5.2"]
+
+    def _is_zhipu_selected(self) -> bool:
+        """当前下拉是否选中智谱 provider。"""
+        return self.ai_model_type.currentText() == self._ZHIPU_LABEL
+
+    def _zhipu_default_base_url(self) -> str:
+        """按当前 Coding Plan 复选框状态返回智谱默认 base_url。"""
+        coding = getattr(self, 'zhipu_coding_plan_cb', None) and self.zhipu_coding_plan_cb.isChecked()
+        return self._ZHIPU_BASE_CODING if coding else self._ZHIPU_BASE_STANDARD
+
+    def _zhipu_curated_models(self) -> list:
+        """按 Coding Plan 状态返回预置模型列表。"""
+        coding = getattr(self, 'zhipu_coding_plan_cb', None) and self.zhipu_coding_plan_cb.isChecked()
+        return list(self._ZHIPU_MODELS_CODING if coding else self._ZHIPU_MODELS_STANDARD)
+
+    def _populate_zhipu_models(self):
+        """用预置模型列表填充下拉（可编辑，保留用户已填模型名）。"""
+        current = self.model_name_combo.currentText()
         self.model_name_combo.clear()
-        self.model_name_combo.addItem("正在加载模型...")
+        self.model_name_combo.addItems(self._zhipu_curated_models())
+        # 跳过加载占位符，仅保留真实模型名
+        if current and current not in ("⏳ 正在拉取模型列表...", "正在加载模型列表..."):
+            self.model_name_combo.setCurrentText(current)
 
-        # 模拟模型加载
-        QTimer.singleShot(1000, self._load_models)
+    def _on_zhipu_coding_plan_toggled(self, _state: int):
+        """切换 Coding Plan：用户显式勾选/取消，直接切到对应官方端点并刷新模型列表。"""
+        if not self._is_zhipu_selected():
+            return
+        # 勾选编程套餐是显式动作：直接采用对应官方端点（coding 或 standard）
+        self.base_url_input.setText(self._zhipu_default_base_url())
+        self._populate_zhipu_models()
 
-    def _load_models(self):
-        """加载模型列表"""
-        try:
-            # 这里应该调用实际的模型加载逻辑
-            models = [
-                "deepseek-r1:1.5b",
-                "deepseek-r1:7b",
-                "deepseek-r1:14b",
-                "qwen2.5-coder:7b",
-                "llama3.1:8b",
-                "mistral:7b"
-            ]
+    def _on_ai_type_changed(self, text: str):
+        """切换 AI 模型类型时，更新 base_url 输入的可用性、占位提示，及智谱 Coding Plan 开关可见性。"""
+        mapping = self._PROVIDER_MAP.get(text)
+        self.base_url_input.setEnabled(bool(mapping and mapping[2]))
+        placeholders = {
+            "本地 Ollama": "如 http://localhost:11434/api/chat",
+            "本地 LM Studio": "如 http://localhost:1234/v1",
+            "云端 DeepSeek": "如 https://api.siliconflow.cn/v1/chat/completions",
+            "🌐 自定义 OpenAI 兼容": "OpenAI 兼容 base，如 https://api.openai.com/v1",
+            self._ZHIPU_LABEL: "如 https://open.bigmodel.cn/api/paas/v4",
+        }
+        self.base_url_input.setPlaceholderText(placeholders.get(text, "API 地址"))
 
-            self.model_name_combo.clear()
+        # Coding Plan 开关仅对智谱可见
+        is_zhipu = text == self._ZHIPU_LABEL
+        if hasattr(self, 'zhipu_coding_plan_cb'):
+            self.zhipu_coding_plan_cb.setVisible(is_zhipu)
+        if is_zhipu:
+            current_url = self.base_url_input.text().strip()
+            # 切到智谱时，若当前地址不是智谱端点（可能继承自 deepseek 等其它 provider），
+            # 重置为智谱默认端点；已是智谱端点则保留。
+            if current_url not in (self._ZHIPU_BASE_STANDARD, self._ZHIPU_BASE_CODING):
+                self.base_url_input.setText(self._zhipu_default_base_url())
+            self._populate_zhipu_models()
+
+    def _current_ai_provider(self):
+        """返回当前下拉选择的 (provider_name, ai_type)。"""
+        text = self.ai_model_type.currentText()
+        mapping = self._PROVIDER_MAP.get(text)
+        if mapping:
+            return mapping[0], mapping[1]
+        return "deepseek", "cloud"
+
+    def refresh_models(self):
+        """从当前配置的 OpenAI 兼容端点拉取可用模型列表（后台线程，不阻塞 UI）。"""
+        base_url = self.base_url_input.text().strip()
+        api_key = self.api_key_input.text().strip()
+
+        if not base_url:
+            QMessageBox.warning(self, "缺少地址", "请先填写 API 地址 (base_url)")
+            return
+
+        # 智谱 /models 需鉴权：未填 API 密钥时直接提示，避免 401 失败把已选模型清空
+        if self._is_zhipu_selected() and not api_key:
+            QMessageBox.warning(
+                self, "缺少 API 密钥",
+                "智谱需要先在「API 密钥」框填入有效 Key 才能拉取模型列表。\n"
+                "也可直接从下拉选择内置模型（glm-4.6 等）或手动输入模型名。"
+            )
+            return
+
+        self.model_name_combo.clear()
+        self.model_name_combo.addItem("⏳ 正在拉取模型列表...")
+
+        def task():
+            models = fetch_available_models(base_url, api_key, timeout=10)
+            if models:
+                return True, f"成功获取 {len(models)} 个模型", models
+            return False, "未能获取模型（端点可能不支持 /models，可手动填写模型名）", []
+
+        self._ai_worker = _BackgroundAIWorker(task)
+        self._ai_worker.result_ready.connect(self._on_models_fetched)
+        self._ai_worker.start()
+
+    @pyqtSlot(bool, str, object)
+    def _on_models_fetched(self, ok: bool, message: str, models):
+        """模型拉取完成回调（主线程）。"""
+        current = self.model_name_combo.currentText()
+        self.model_name_combo.clear()
+        if ok and models:
             self.model_name_combo.addItems(models)
-            self.model_name_combo.setCurrentIndex(0)
-
-        except Exception as e:
-            self.model_name_combo.clear()
-            self.model_name_combo.addItem(f"加载失败: {str(e)[:30]}...")
+            # 尽量保留用户已填写的模型名
+            if current and current not in ("⏳ 正在拉取模型列表...",):
+                self.model_name_combo.setCurrentText(current)
+            self.ai_status_label.setText(f"✅ {message}")
+            self.ai_status_label.setStyleSheet("color: #10b981;")
+        else:
+            # 拉取失败：智谱恢复内置模型列表，避免下拉被清空；其它 provider 仍可手填
+            if self._is_zhipu_selected():
+                self._populate_zhipu_models()
+                self.ai_status_label.setText(
+                    "⚠️ 拉取失败（多为 API 密钥为空或无效）；已恢复内置模型列表，可直接选择或手动填写"
+                )
+            else:
+                self.ai_status_label.setText(f"⚠️ {message}")
+            self.ai_status_label.setStyleSheet("color: #d97706;")
 
     def test_ai_connection(self):
-        """测试AI连接"""
-        try:
-            self.ai_status_label.setText("🔄 正在测试...")
-            # 模拟连接测试
-            QTimer.singleShot(2000, self._ai_test_result)
-        except Exception as e:
-            self.ai_status_label.setText(f"❌ 测试失败: {str(e)}")
+        """测试与 AI 端点的连接（后台线程，真实请求 GET /models）。"""
+        base_url = self.base_url_input.text().strip()
+        api_key = self.api_key_input.text().strip()
 
-    def _ai_test_result(self):
-        """AI测试结果"""
-        # 模拟测试成功
-        self.ai_status_label.setText("✅ 连接测试成功")
-        self.ai_status_label.setStyleSheet("color: #10b981;")
+        if not base_url:
+            QMessageBox.warning(self, "缺少地址", "请先填写 API 地址 (base_url)")
+            return
+
+        self.ai_status_label.setText("🔄 正在测试连接...")
+        self.ai_status_label.setStyleSheet("color: #6b7280;")
+
+        def task():
+            headers = {'Content-Type': 'application/json'}
+            if api_key:
+                headers['Authorization'] = f'Bearer {api_key}'
+            # 派生 /models 端点：去掉可能的 /chat/completions 后缀
+            base = base_url.rstrip('/')
+            if base.endswith('/chat/completions'):
+                base = base[:-len('/chat/completions')]
+            models_url = base + '/models'
+            try:
+                resp = requests.get(models_url, headers=headers, timeout=10)
+            except requests.exceptions.Timeout:
+                return False, "请求超时，请检查地址与网络", 0
+            except requests.exceptions.ConnectionError:
+                return False, "无法连接到服务器，请检查地址与端口", 0
+            status = resp.status_code
+            if status == 200:
+                return True, "连接成功", status
+            if status == 401:
+                return False, "认证失败：API 密钥无效或缺失", status
+            if status == 404:
+                return False, "地址错误：/models 返回 404", status
+            return False, f"连接失败 (HTTP {status})", status
+
+        self._ai_worker = _BackgroundAIWorker(task)
+        self._ai_worker.result_ready.connect(self._on_connection_tested)
+        self._ai_worker.start()
+
+    @pyqtSlot(bool, str, object)
+    def _on_connection_tested(self, ok: bool, message: str, status):
+        """连接测试结果回调（主线程）。"""
+        if ok:
+            self.ai_status_label.setText(f"✅ {message}")
+            self.ai_status_label.setStyleSheet("color: #10b981;")
+        else:
+            self.ai_status_label.setText(f"❌ {message}")
+            self.ai_status_label.setStyleSheet("color: #ef4444;")
+
+    def _load_ai_config_from_yaml(self):
+        """启动时从 config.yaml 回填 AI 配置到界面控件。"""
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            return
+        except Exception:
+            return  # 配置不可读时静默，使用界面默认值
+
+        ai_cfg = config.get('ai', {}) or {}
+        cloud_provider = ai_cfg.get('cloud_provider') or ai_cfg.get('local_provider') or 'deepseek'
+
+        # 反向映射 provider 名 -> 下拉文本
+        label = "云端 DeepSeek"
+        for lbl, (prov, _typ, _url) in self._PROVIDER_MAP.items():
+            if prov == cloud_provider:
+                label = lbl
+                break
+        idx = self.ai_model_type.findText(label)
+        if idx >= 0:
+            self.ai_model_type.setCurrentIndex(idx)
+
+        # 按当前 provider 读取对应配置段
+        section = config.get(cloud_provider, {}) or {}
+        # 智谱：先同步 Coding Plan 开关状态（影响默认 base_url 与模型列表的派生）
+        if cloud_provider == 'zhipu' and hasattr(self, 'zhipu_coding_plan_cb'):
+            self.zhipu_coding_plan_cb.setChecked(bool(section.get('coding_plan', False)))
+        if section.get('base_url'):
+            self.base_url_input.setText(str(section['base_url']))
+        elif cloud_provider == 'zhipu':
+            # base_url 留空：按 coding_plan 状态填默认端点
+            self.base_url_input.setText(self._zhipu_default_base_url())
+        if section.get('api_key'):
+            self.api_key_input.setText(str(section['api_key']))
+        if section.get('model'):
+            self.model_name_combo.setCurrentText(str(section['model']))
+
+    def _save_ai_config_to_yaml(self):
+        """把界面上的 AI 配置写回 config.yaml（按所选 provider 更新对应段，保留注释）。"""
+        provider, ai_type = self._current_ai_provider()
+        base_url = self.base_url_input.text().strip()
+        api_key = self.api_key_input.text().strip()
+        model = self.model_name_combo.currentText().strip()
+
+        if not base_url and provider in ('custom', 'deepseek'):
+            QMessageBox.warning(self, "缺少地址", "请先填写 API 地址 (base_url)")
+            return
+
+        # 优先用 ruamel.yaml 做注释保留的 round-trip；不可用时回退到 PyYAML（会丢注释）
+        use_ruamel = False
+        try:
+            from ruamel.yaml import YAML
+            yaml_rt = YAML()
+            yaml_rt.preserve_quotes = True
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                config = yaml_rt.load(f) or {}
+            use_ruamel = True
+        except Exception:
+            try:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                config = {}
+            except Exception as e:
+                QMessageBox.critical(self, "读取配置失败", str(e))
+                return
+
+        # 更新 ai.type / ai.cloud_provider / ai.local_provider
+        ai_cfg = config.setdefault('ai', {})
+        ai_cfg['type'] = ai_type
+        if ai_type == 'cloud':
+            ai_cfg['cloud_provider'] = provider
+        else:
+            ai_cfg['local_provider'] = provider
+
+        # 按所选 provider 更新对应配置段
+        if provider in ('custom', 'deepseek'):
+            section = config.setdefault(provider, {})
+            section['base_url'] = base_url
+            section['api_key'] = api_key
+            if model:
+                section['model'] = model
+            section.setdefault('timeout', 30)
+            section.setdefault('max_tokens', 2048)
+        elif provider == 'zhipu':
+            section = config.setdefault('zhipu', {})
+            section['base_url'] = base_url
+            section['api_key'] = api_key
+            if model:
+                section['model'] = model
+            section['coding_plan'] = bool(self.zhipu_coding_plan_cb.isChecked())
+            # GLM-5 等推理模型需要更长超时与更大 max_tokens；用户若已设更大值则保留
+            section['timeout'] = max(int(section.get('timeout') or 0), 120)
+            section['max_tokens'] = max(int(section.get('max_tokens') or 0), 4096)
+        elif provider == 'ollama':
+            section = config.setdefault('ollama', {})
+            if base_url:
+                section['base_url'] = base_url
+            if model:
+                section['model'] = model
+            section.setdefault('timeout', 60)
+        elif provider == 'lm_studio':
+            section = config.setdefault('lm_studio', {})
+            if base_url:
+                section['base_url'] = base_url
+            if model:
+                section['model'] = model
+
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                if use_ruamel:
+                    yaml_rt.dump(config, f)
+                else:
+                    yaml.safe_dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        except Exception as e:
+            QMessageBox.critical(self, "保存配置失败", str(e))
+            return
+
+        QMessageBox.information(
+            self, "保存成功",
+            f"AI 配置已保存到 config.yaml\n(provider={provider}, type={ai_type})"
+        )
 
     def clear_cache(self):
         """清空缓存"""
@@ -912,6 +1297,9 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         if config['ai_enabled'] and not config['model_name']:
             QMessageBox.warning(self, "配置错误", "启用AI分析时需要指定模型名称")
             return
+
+        # 记录本次分析的日志路径，供导出报告使用
+        self.last_log_path = config['log_path']
 
         # 禁用按钮
         self.start_button.setEnabled(False)
@@ -1014,6 +1402,7 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
         self.stop_button.setEnabled(False)
 
         if success:
+            self.last_results = results  # 保存结果，供「导出报告」使用
             elapsed = time.time() - self.start_time
             self.append_log(f"✅ 分析完成！总耗时: {elapsed:.1f}秒")
 
@@ -1032,18 +1421,98 @@ class OptimizedLogAnalyzerGUI(QMainWindow):
             QMessageBox.critical(self, "分析失败", message)
 
     def export_report(self):
-        """导出报告"""
+        """把最近一次分析结果导出为 HTML 报告。"""
+        output_dir = self.output_dir_input.text().strip()
+        if not output_dir:
+            QMessageBox.warning(self, "导出失败", "请先配置输出目录")
+            return
+        if not self.last_results:
+            QMessageBox.warning(self, "导出失败", "请先运行一次分析，再导出报告")
+            return
         try:
-            output_dir = self.output_dir_input.text()
-            if not output_dir:
-                QMessageBox.warning(self, "导出失败", "请先配置输出目录")
-                return
-
-            # 这里应该调用实际的报告导出功能
-            QMessageBox.information(self, "导出成功", f"报告已导出到: {output_dir}")
-
+            os.makedirs(output_dir, exist_ok=True)
+            html_doc = self._render_report_html(self.last_results, self.last_log_path)
+            fname = "sslogs-report-" + time.strftime("%Y%m%d-%H%M%S") + ".html"
+            path = os.path.join(output_dir, fname)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html_doc)
+            n = len(self.last_results.get('threats', []))
+            QMessageBox.information(self, "导出成功", f"已导出 {n} 条威胁的报告：\n{path}")
+            self.append_log(f"📄 报告已导出: {path}")
         except Exception as e:
-            QMessageBox.critical(self, "导出失败", f"导出报告时发生错误: {str(e)}")
+            QMessageBox.critical(self, "导出失败", f"导出报告时发生错误: {e}")
+
+    def _render_report_html(self, results, log_path):
+        """根据分析结果渲染一份自包含的 HTML 报告。"""
+        import html as _html
+        from collections import Counter
+        esc = _html.escape
+        perf = results.get('performance', {}) or {}
+        threats = results.get('threats', []) or []
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        # 威胁类型统计
+        type_count = Counter()
+        for t in threats:
+            for x in t.get('threats', []):
+                type_count[getattr(x, 'value', str(x))] += 1
+        type_rows = "".join(f"<tr><td>{esc(k)}</td><td>{v}</td></tr>"
+                            for k, v in type_count.most_common()) or '<tr><td colspan="2">无</td></tr>'
+
+        # 威胁详情卡片
+        cards = []
+        for i, t in enumerate(threats, 1):
+            names = ", ".join(getattr(x, 'value', str(x)) for x in t.get('threats', [])) or "未知"
+            risk = float(t.get('risk_score', 0) or 0)
+            line = esc(t.get('line', ''))
+            ai = t.get('ai_analysis')
+            ai_html = (f'<div class="ai">{esc(ai)}</div>' if ai
+                       else '<div class="ai none">（未进行AI深度分析）</div>')
+            color = '#ef4444' if risk >= 8 else ('#f59e0b' if risk >= 5 else '#3b82f6')
+            cards.append(
+                f'<div class="threat" style="border-left:4px solid {color}">'
+                f'<div class="th-head"><span class="idx">#{i}</span>'
+                f'<span class="typ">{esc(names)}</span>'
+                f'<span class="risk" style="background:{color}">风险 {risk:.1f}</span></div>'
+                f'<div class="line"><code>{line}</code></div>{ai_html}</div>'
+            )
+        detail_html = "".join(cards) or '<p class="empty">未检测到威胁 🎉</p>'
+
+        return f"""<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SSlogs 安全分析报告</title>
+<style>
+ body{{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:24px;color:#1f2937;max-width:1100px}}
+ h1{{color:#111827;border-bottom:2px solid #10b981;padding-bottom:8px}}
+ h3{{margin-top:28px;color:#111827}}
+ .meta{{color:#6b7280;font-size:14px;margin-bottom:16px}}
+ .stat{{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px}}
+ .stat .b{{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px 16px;min-width:120px}}
+ .stat .n{{font-size:22px;font-weight:700;color:#111827}} .stat .l{{font-size:12px;color:#6b7280}}
+ table{{border-collapse:collapse;margin:8px 0;font-size:14px}}
+ td,th{{border:1px solid #e5e7eb;padding:6px 10px}} th{{background:#f3f4f6;text-align:left}}
+ .threat{{background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:10px 12px;margin:10px 0}}
+ .th-head{{display:flex;gap:8px;align-items:center;margin-bottom:6px;font-weight:600;font-size:14px}}
+ .idx{{color:#9ca3af}} .risk{{color:#fff;padding:2px 8px;border-radius:10px;font-size:12px}}
+ .line code{{word-break:break-all;background:#f3f4f6;padding:4px 6px;border-radius:4px;font-size:12px;display:block}}
+ .ai{{margin-top:8px;padding:8px 10px;background:#f0fdf4;border-radius:4px;white-space:pre-wrap;font-size:13px;border:1px solid #bbf7d0;line-height:1.6}}
+ .ai.none{{background:#f9fafb;border-color:#e5e7eb;color:#9ca3af}}
+ .empty{{color:#10b981;font-size:16px}}
+</style></head><body>
+<h1>🛡️ SSlogs 安全分析报告</h1>
+<div class="meta">日志: {esc(log_path or '未知')}　|　生成时间: {ts}</div>
+<div class="stat">
+ <div class="b"><div class="n">{perf.get('processed_count', 0)}</div><div class="l">处理日志条数</div></div>
+ <div class="b"><div class="n">{len(threats)}</div><div class="l">威胁条数</div></div>
+ <div class="b"><div class="n">{perf.get('total_time', 0):.1f}s</div><div class="l">耗时</div></div>
+ <div class="b"><div class="n">{perf.get('memory_peak', 0):.1f}%</div><div class="l">内存峰值</div></div>
+</div>
+<h3>威胁类型分布</h3>
+<table><tr><th>类型</th><th>次数</th></tr>{type_rows}</table>
+<h3>威胁详情（{len(threats)} 条）</h3>
+{detail_html}
+</body></html>"""
 
 
 def main():
