@@ -86,6 +86,10 @@
 
 ## 🏗️ 系统架构
 
+[![SSlogs 系统架构动画图：用户入口、分析管线、AI 双通道与外部模型服务](https://prlens.dev/c/JuYXxW0kHlFK0KShK5QPwA.svg)](https://prlens.dev/c/JuYXxW0kHlFK0KShK5QPwA)
+
+> 🎬 点击图片打开可交互的动画架构图，含 **"分析一批日志"数据流时序**（解压 → 解析 → 规则匹配 → AI 复核 → 报告）与分步讲解。模块速览：
+
 ```
 日志分析工具
 ├── 核心模块 (core/)
