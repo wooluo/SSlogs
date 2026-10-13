@@ -45,6 +45,25 @@ class EventHandler:
     retry_on_error: bool = True
 
 
+def _normalize_priority(priority: Any) -> EventPriority:
+    """将优先级归一化为 EventPriority 枚举。
+
+    兼容调用方传入字符串（如 'high'/'normal'/'low'/'critical'，大小写不敏感；
+    'medium'/'default' 视为 NORMAL）。避免后续 handler.priority.value 在字符串上
+    触发 'str' object has no attribute 'value'。
+    """
+    if isinstance(priority, EventPriority):
+        return priority
+    if isinstance(priority, str):
+        key = priority.strip().upper()
+        alias = {'MEDIUM': 'NORMAL', 'DEFAULT': 'NORMAL'}
+        try:
+            return EventPriority[alias.get(key, key)]
+        except KeyError:
+            return EventPriority.NORMAL
+    return EventPriority.NORMAL
+
+
 class EventBus:
     """事件总线 - 实现模块间的解耦通信"""
 
@@ -67,6 +86,7 @@ class EventBus:
                  filter_func: Optional[Callable[[Event], bool]] = None,
                  timeout: Optional[float] = None, retry_on_error: bool = True) -> str:
         """订阅事件"""
+        priority = _normalize_priority(priority)
         handler_name = name or f"{handler_func.__module__}.{handler_func.__name__}"
 
         handler = EventHandler(
@@ -100,6 +120,7 @@ class EventBus:
                         name: Optional[str] = None, priority: EventPriority = EventPriority.NORMAL,
                         filter_func: Optional[Callable[[Event], bool]] = None) -> str:
         """订阅所有事件（全局处理器）"""
+        priority = _normalize_priority(priority)
         handler_name = name or f"{handler_func.__module__}.{handler_func.__name__}"
 
         handler = EventHandler(

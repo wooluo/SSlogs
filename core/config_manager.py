@@ -104,6 +104,19 @@ class ConfigManager:
                 api_key = deepseek_config.get('api_key', '')
                 if not api_key or api_key in ['your-api-key-here', 'YOUR_API_KEY', 'demo_key_for_testing']:
                     errors.append("DeepSeek API密钥未正确配置 (当前使用占位符)")
+            elif cloud_provider == 'custom':
+                # 自定义 OpenAI 兼容端点：必须有 base_url（api_key 允许留空走环境变量）
+                custom_config = self._config.get('custom', {})
+                if not custom_config.get('base_url'):
+                    errors.append("自定义AI配置(custom)缺少 base_url")
+                if not custom_config.get('model'):
+                    errors.append("自定义AI配置(custom)缺少 model")
+            elif cloud_provider == 'zhipu':
+                # 智谱 GLM：要求 model；base_url 允许留空（由 coding_plan 派生默认），
+                # api_key 允许留空（走环境变量 SSLOGS_AI_API_KEY）
+                zhipu_config = self._config.get('zhipu', {})
+                if not zhipu_config.get('model'):
+                    errors.append("智谱AI配置(zhipu)缺少 model")
 
         # 4. 验证路径字段
         for path_field in ['rule_dir', 'output_dir']:
@@ -119,7 +132,7 @@ class ConfigManager:
         # 5. 验证枚举类型字段
         enum_validations = {
             'ai.type': ['cloud', 'local'],
-            'ai.cloud_provider': ['deepseek', 'openai'],
+            'ai.cloud_provider': ['deepseek', 'openai', 'custom', 'zhipu'],
             'ai.local_provider': ['ollama', 'lm_studio'],
             'report_type': ['html', 'json', 'markdown'],
         }
@@ -146,6 +159,8 @@ class ConfigManager:
             'ai_analysis.max_ai_analysis': (1, 100, "AI分析数量应在1-100之间"),
             'deepseek.timeout': (5, 300, "DeepSeek超时应在5-300秒之间"),
             'ollama.timeout': (5, 600, "Ollama超时应在5-600秒之间"),
+            'custom.timeout': (5, 600, "自定义AI超时应在5-600秒之间"),
+            'zhipu.timeout': (5, 600, "智谱AI超时应在5-600秒之间"),
         }
 
         for field_path, (min_val, max_val, error_msg) in range_validations.items():
@@ -158,6 +173,7 @@ class ConfigManager:
         url_validations = [
             'deepseek.base_url',
             'ollama.base_url',
+            'custom.base_url',
         ]
 
         for field_path in url_validations:
@@ -300,6 +316,25 @@ class ConfigManager:
         ollama.setdefault('base_url', 'http://localhost:11434/api/chat')
         ollama.setdefault('timeout', 60)
 
+        # 自定义 OpenAI 兼容端点默认值（cloud_provider=custom 时启用）
+        self._config.setdefault('custom', {})
+        custom = self._config['custom']
+        custom.setdefault('base_url', '')
+        custom.setdefault('api_key', '')
+        custom.setdefault('model', '')
+        custom.setdefault('timeout', 30)
+        custom.setdefault('max_tokens', 2048)
+
+        # 智谱 GLM 默认值（cloud_provider=zhipu 时启用）
+        self._config.setdefault('zhipu', {})
+        zhipu = self._config['zhipu']
+        zhipu.setdefault('base_url', '')          # 留空则由 coding_plan 派生默认端点
+        zhipu.setdefault('api_key', '')           # 留空则读取环境变量 SSLOGS_AI_API_KEY
+        zhipu.setdefault('model', 'glm-4.6')
+        zhipu.setdefault('coding_plan', False)
+        zhipu.setdefault('timeout', 120)
+        zhipu.setdefault('max_tokens', 4096)      # GLM-5 等推理模型需要更大空间产出正式回答
+
         # 重试配置默认值
         ai.setdefault('max_retries', 3)
         ai.setdefault('retry_delay', 1)
@@ -321,13 +356,15 @@ class ConfigManager:
         """获取安全的配置（隐藏敏感信息）"""
         config = self.get_config().copy()
 
-        # 隐藏敏感信息
-        if 'deepseek' in config and 'api_key' in config['deepseek']:
-            api_key = config['deepseek']['api_key']
-            if api_key and len(api_key) > 8:
-                config['deepseek']['api_key'] = api_key[:4] + '*' * (len(api_key) - 8) + api_key[-4:]
-            else:
-                config['deepseek']['api_key'] = '***'
+        # 隐藏敏感信息（deepseek、智谱与自定义端点的 api_key 均需脱敏）
+        for section_name in ('deepseek', 'custom', 'zhipu'):
+            section = config.get(section_name)
+            if isinstance(section, dict) and 'api_key' in section:
+                api_key = section['api_key']
+                if api_key and len(api_key) > 8:
+                    config[section_name]['api_key'] = api_key[:4] + '*' * (len(api_key) - 8) + api_key[-4:]
+                else:
+                    config[section_name]['api_key'] = '***'
 
         return config
 

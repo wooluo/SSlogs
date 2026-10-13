@@ -207,6 +207,43 @@ deepseek:
         finally:
             os.unlink(temp_path)
 
+    def test_get_safe_config_custom(self):
+        """测试自定义端点 custom.api_key 同样被脱敏"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+custom:
+  api_key: sk-1234567890abcdef
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            manager.load_config()
+            safe_config = manager.get_safe_config()
+
+            # 自定义端点的 API 密钥也应被脱敏（保留首4/末4，中间以 * 替换）
+            masked = safe_config['custom']['api_key']
+            assert masked != 'sk-1234567890abcdef'   # 已脱敏，不再是明文
+            assert masked.startswith('sk-1') and masked.endswith('cdef')
+            assert '*' in masked
+            # base_url 等非敏感字段保持不变
+            assert 'https://api.openai.com/v1' == safe_config['custom']['base_url']
+        finally:
+            os.unlink(temp_path)
+
+
 
 class TestConfigValidation:
     """配置验证测试"""
@@ -279,6 +316,175 @@ report_type: invalid_format  # 无效的报告格式
             assert '值无效' in error_message
         finally:
             os.unlink(temp_path)
+
+    def test_custom_cloud_provider_accepted(self):
+        """测试 cloud_provider=custom 且 custom 配置完整时通过校验"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+ai:
+  type: cloud
+  cloud_provider: custom
+
+custom:
+  base_url: https://api.openai.com/v1
+  api_key: sk-1234567890abcdef
+  model: gpt-4o-mini
+  timeout: 30
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            # 配置完整时不应抛出校验异常
+            manager.load_config()
+            assert manager.get_config()['ai']['cloud_provider'] == 'custom'
+        finally:
+            os.unlink(temp_path)
+
+    def test_custom_cloud_provider_missing_base_url_rejected(self):
+        """测试 cloud_provider=custom 但缺少 base_url 时被校验拦截"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+ai:
+  type: cloud
+  cloud_provider: custom
+
+custom:
+  base_url: ""
+  model: gpt-4o-mini
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            with pytest.raises(ConfigurationError) as exc_info:
+                manager.load_config()
+            assert 'base_url' in str(exc_info.value)
+        finally:
+            os.unlink(temp_path)
+
+    def test_zhipu_cloud_provider_accepted(self):
+        """测试 cloud_provider=zhipu 且 zhipu 含 model 时通过校验（base_url 可留空）"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+ai:
+  type: cloud
+  cloud_provider: zhipu
+
+zhipu:
+  base_url: ""
+  api_key: zhipu-secret-key
+  model: glm-4.6
+  coding_plan: false
+  timeout: 30
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            manager.load_config()
+            assert manager.get_config()['ai']['cloud_provider'] == 'zhipu'
+        finally:
+            os.unlink(temp_path)
+
+    def test_zhipu_cloud_provider_missing_model_rejected(self):
+        """测试 cloud_provider=zhipu 但缺少 model 时被校验拦截"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+
+ai:
+  type: cloud
+  cloud_provider: zhipu
+
+zhipu:
+  api_key: zhipu-key
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            with pytest.raises(ConfigurationError) as exc_info:
+                manager.load_config()
+            assert 'model' in str(exc_info.value)
+        finally:
+            os.unlink(temp_path)
+
+    def test_zhipu_defaults_and_safe_config(self):
+        """_set_defaults 生成 zhipu 段，且 get_safe_config 对 zhipu.api_key 脱敏"""
+        config_content = """
+log_path: logs/*.log
+log_format:
+  type: web
+  fields:
+    src_ip: (\\d+\\.\\d+\\.\\d+\\.\\d+)
+
+rule_dir: rules
+output_dir: output
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(config_content)
+            temp_path = f.name
+
+        try:
+            manager = ConfigManager(temp_path)
+            manager.load_config()
+            # _set_defaults 应已生成 zhipu 段默认值
+            zhipu = manager.get_config().get('zhipu', {})
+            assert zhipu.get('model') == 'glm-4.6'
+            assert zhipu.get('coding_plan') is False
+            assert zhipu.get('timeout') == 120   # GLM-5 推理模型较慢，默认更长超时
+            assert zhipu.get('max_tokens') == 4096
+            # 模拟用户填入真实密钥后脱敏
+            manager._config.setdefault('zhipu', {})
+            manager._config['zhipu']['api_key'] = 'sk-zhipu-1234567890abcdef'
+
+            safe = manager.get_safe_config()
+            masked = safe['zhipu']['api_key']
+            assert masked != 'sk-zhipu-1234567890abcdef'  # 已脱敏
+            assert masked.startswith('sk-z') and masked.endswith('cdef')
+            assert '*' in masked
+        finally:
+            os.unlink(temp_path)
+
 
 
 class TestConfigValidationMethods:
